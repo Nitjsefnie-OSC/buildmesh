@@ -244,6 +244,7 @@ mod guest_path_tests {
             (r"C:\Users\Adam\Foo.TXT", "/mnt/c/Users/Adam/Foo.TXT"),
             (r"C:\", "/mnt/c/"),
             (r"C:", r"C:"),
+            (r"C:file.txt", r"C:file.txt"),
             (r"C:/Users/adam/x", "/mnt/c/Users/adam/x"),
             (r"\\WSL$\Ubuntu\home\a", "/home/a"),
             (r"\\Wsl.LocalHost\Ubuntu\home\a", "/home/a"),
@@ -269,6 +270,19 @@ mod guest_path_tests {
                 to_guest_path_with_distro(input, Some("ubuntu")),
                 expected,
                 "conversion mismatch for {input:?}"
+            );
+        }
+
+        for (input, expected) in [
+            (r"C:\Users\adam\file.txt", "/mnt/c/Users/adam/file.txt"),
+            (r"\\wsl$\Ubuntu\home\adam\x", "/home/adam/x"),
+        ] {
+            let converted = to_guest_path_with_distro(input, Some("ubuntu"));
+            assert_eq!(converted, expected, "conversion mismatch for {input:?}");
+            assert_eq!(
+                to_guest_path_with_distro(&converted, Some("ubuntu")),
+                converted,
+                "conversion is not idempotent for {input:?}"
             );
         }
 
