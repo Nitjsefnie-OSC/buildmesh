@@ -116,6 +116,198 @@ pub fn to_host_path(path: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WslUnc<'a> {
+    distro: &'a str,
+    remainder_start: Option<usize>,
+}
+
+fn is_separator(byte: u8) -> bool {
+    byte == b'\\' || byte == b'/'
+}
+
+fn has_wsl_unc_share(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !is_separator(bytes[0]) || !is_separator(bytes[1]) {
+        return false;
+    }
+
+    let share_end = (2..bytes.len())
+        .find(|&index| is_separator(bytes[index]))
+        .unwrap_or(bytes.len());
+    let share = &path[2..share_end];
+    share.eq_ignore_ascii_case("wsl$") || share.eq_ignore_ascii_case("wsl.localhost")
+}
+
+fn parse_wsl_unc(path: &str) -> Option<WslUnc<'_>> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !is_separator(bytes[0]) || !is_separator(bytes[1]) {
+        return None;
+    }
+
+    let share_end = (2..bytes.len())
+        .find(|&index| is_separator(bytes[index]))
+        .unwrap_or(bytes.len());
+    let share = &path[2..share_end];
+    if !(share.eq_ignore_ascii_case("wsl$")
+        || share.eq_ignore_ascii_case("wsl.localhost"))
+    {
+        return None;
+    }
+
+    let distro_start = share_end.checked_add(1)?;
+    if distro_start >= bytes.len() || is_separator(bytes[distro_start]) {
+        return None;
+    }
+
+    let distro_end = (distro_start..bytes.len())
+        .find(|&index| is_separator(bytes[index]))
+        .unwrap_or(bytes.len());
+    if distro_end == distro_start {
+        return None;
+    }
+
+    Some(WslUnc {
+        distro: &path[distro_start..distro_end],
+        remainder_start: (distro_end < bytes.len()).then_some(distro_end),
+    })
+}
+
+/// Convert a Windows host path into the WSL guest namespace for a disclosed
+/// default distro. The distro comparison is deliberately a heuristic: the
+/// receiving process's distro is not recorded, so a mismatch or unknown distro
+/// fails open and returns the input unchanged rather than resolving the wrong
+/// file.
+pub(crate) fn to_guest_path_with_distro(path: &str, default_distro: Option<&str>) -> String {
+    if !cfg!(target_os = "windows") {
+        return path.to_string();
+    }
+
+    if let Some(unc) = parse_wsl_unc(path) {
+        let Some(default_distro) = default_distro else {
+            return path.to_string();
+        };
+        if !unc.distro.eq_ignore_ascii_case(default_distro) {
+            return path.to_string();
+        }
+
+        return match unc.remainder_start {
+            Some(start) => path[start..].replace('\\', "/"),
+            None => "/".to_string(),
+        };
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && is_separator(bytes[2])
+    {
+        let drive = bytes[0].to_ascii_lowercase() as char;
+        return format!("/mnt/{drive}{}", path[2..].replace('\\', "/"));
+    }
+
+    path.to_string()
+}
+
+/// Convert a host path into the WSL guest namespace when the path names the
+/// process's disclosed default distro. The comparison is a heuristic because
+/// the receiving process's distro is not recorded; mismatch or unknown distro
+/// deliberately fails open to avoid resolving the wrong file.
+pub fn to_guest_path(path: &str) -> String {
+    if !cfg!(target_os = "windows") {
+        return path.to_string();
+    }
+
+    // Drive and ordinary paths do not need a distro probe. WSL UNC-shaped
+    // inputs are the only ones for which the cached default is consulted.
+    if !has_wsl_unc_share(path) {
+        return to_guest_path_with_distro(path, None);
+    }
+
+    let default_distro = super::environment::get_default_wsl_distro();
+    to_guest_path_with_distro(path, default_distro.as_deref())
+}
+
+#[cfg(test)]
+mod guest_path_tests {
+    use super::to_guest_path_with_distro;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn conversion_table_t1_to_t25() {
+        let cases = [
+            (r"C:\Users\adam\file.txt", "/mnt/c/Users/adam/file.txt"),
+            (r"\\wsl$\Ubuntu\home\adam\x", "/home/adam/x"),
+            (r"D:\data\x.txt", "/mnt/d/data/x.txt"),
+            (r"c:\users\adam", "/mnt/c/users/adam"),
+            (r"C:\Users\Adam\Foo.TXT", "/mnt/c/Users/Adam/Foo.TXT"),
+            (r"C:\", "/mnt/c/"),
+            (r"C:", r"C:"),
+            (r"C:/Users/adam/x", "/mnt/c/Users/adam/x"),
+            (r"\\WSL$\Ubuntu\home\a", "/home/a"),
+            (r"\\Wsl.LocalHost\Ubuntu\home\a", "/home/a"),
+            (r"//wsl$/Ubuntu/home/a/x", "/home/a/x"),
+            (r"\\wsl$\Ubuntu", "/"),
+            (r"\\wsl$\Ubuntu\", "/"),
+            (r"\\wsl$\Other\home\adam\x", r"\\wsl$\Other\home\adam\x"),
+            (r"\\wsl$\", r"\\wsl$\"),
+            (r"\\server\share\file.txt", r"\\server\share\file.txt"),
+            (r"\\", r"\\"),
+            (r"/mnt/c/x", "/mnt/c/x"),
+            (r"/home/adam/x", "/home/adam/x"),
+            (r"/c/x", "/c/x"),
+            (r"C:\Users\adam\Ünïcode\файл.txt", "/mnt/c/Users/adam/Ünïcode/файл.txt"),
+            (r"C:\Users\adam\", "/mnt/c/Users/adam/"),
+            (r"\\wsl$\Ubuntu\home\\adam\", "/home//adam/"),
+            ("", ""),
+            (r"foo\bar.txt", r"foo\bar.txt"),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                to_guest_path_with_distro(input, Some("ubuntu")),
+                expected,
+                "conversion mismatch for {input:?}"
+            );
+        }
+
+        assert_eq!(
+            to_guest_path_with_distro(r"\\wsl$\Ubuntu\home\adam\x", None),
+            r"\\wsl$\Ubuntu\home\adam\x"
+        );
+        assert_eq!(
+            to_guest_path_with_distro(r"\\wsl$\\home\adam", Some("Ubuntu")),
+            r"\\wsl$\\home\adam"
+        );
+        assert_eq!(
+            to_guest_path_with_distro(r"\\wsl$\Ubuntu\home\adam\x", Some("Debian")),
+            r"\\wsl$\Ubuntu\home\adam\x"
+        );
+        assert_eq!(
+            to_guest_path_with_distro(r"//wsl.localhost/Ubuntu/home/a", Some("Ubuntu")),
+            "/home/a"
+        );
+        assert_eq!(
+            to_guest_path_with_distro(r"/mnt/c/Users/adam/file.txt", Some("Ubuntu")),
+            "/mnt/c/Users/adam/file.txt"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_inputs_are_identity() {
+        for input in [
+            r"C:\Users\adam\file.txt",
+            r"\\wsl$\Ubuntu\home\adam\x",
+            r"//wsl.localhost/Ubuntu/home/a",
+            r"\\server\share\file.txt",
+        ] {
+            assert_eq!(to_guest_path_with_distro(input, Some("Ubuntu")), input);
+        }
+    }
+}
+
 // ── ResolvedPath — high-level path resolution for agent operations ─────────
 
 /// A fully-resolved set of paths for an agent node, ready for use by callers
