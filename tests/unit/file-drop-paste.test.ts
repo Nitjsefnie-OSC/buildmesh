@@ -33,19 +33,19 @@ describe('quotePathIfNeeded', () => {
 
 describe('resolveDropText', () => {
   it('routes each path through to_host_path', async () => {
-    await resolveDropText(['/mnt/c/Users/adam/file.txt']);
+    await resolveDropText(['/mnt/c/Users/adam/file.txt'], 'windows');
     expect(mockedInvoke).toHaveBeenCalledWith('to_host_path', { path: '/mnt/c/Users/adam/file.txt' });
   });
 
   it('joins multiple paths with a space and quotes those with spaces', async () => {
-    const text = await resolveDropText(['C:\\a.txt', 'C:\\My Files\\b.txt']);
+    const text = await resolveDropText(['C:\\a.txt', 'C:\\My Files\\b.txt'], 'windows');
     expect(text).toBe('C:\\a.txt "C:\\My Files\\b.txt"');
   });
 
   it('drops empty host paths', async () => {
     mockedInvoke.mockResolvedValueOnce('');
     mockedInvoke.mockResolvedValueOnce('C:\\b.txt');
-    const text = await resolveDropText(['bad', 'good']);
+    const text = await resolveDropText(['bad', 'good'], 'windows');
     expect(text).toBe('C:\\b.txt');
   });
 });
@@ -53,7 +53,7 @@ describe('resolveDropText', () => {
 describe('pasteDropPaths', () => {
   it('pastes the resolved absolute path into the terminal and focuses it', async () => {
     const target = { paste: vi.fn(), focus: vi.fn() };
-    await pasteDropPaths(target, ['C:\\Users\\adam\\file.txt']);
+    await pasteDropPaths(target, ['C:\\Users\\adam\\file.txt'], 'windows');
     // The regression: a dropped file must be *pasted* (reaches the PTY via onData),
     // not written to the display buffer, and must carry the absolute path.
     expect(target.paste).toHaveBeenCalledWith('C:\\Users\\adam\\file.txt');
@@ -63,7 +63,7 @@ describe('pasteDropPaths', () => {
   it('does nothing when no usable path resolves', async () => {
     mockedInvoke.mockResolvedValue('');
     const target = { paste: vi.fn(), focus: vi.fn() };
-    await pasteDropPaths(target, ['']);
+    await pasteDropPaths(target, [''], 'windows');
     expect(target.paste).not.toHaveBeenCalled();
   });
 });

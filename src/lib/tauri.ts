@@ -743,6 +743,9 @@ export const autoResumeAgentNodes = () =>
 export const toHostPath = (path: string) =>
   _invoke<string>('to_host_path', { path });
 
+export const toGuestPath = (path: string) =>
+  _invoke<string>('to_guest_path', { path });
+
 /** Native clipboard read. On macOS this bypasses the WKWebView
  *  clipboard-permission popup by shelling to `pbpaste`; on other platforms it
  *  may reject, and callers fall back to `navigator.clipboard.readText()`. */

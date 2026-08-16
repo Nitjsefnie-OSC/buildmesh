@@ -1,6 +1,7 @@
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { terminalManager } from '../components/Terminal/Terminal';
 import { useUIStore } from '../stores/uiStore';
+import { useAgentNodeStore } from '../stores/agentNodeStore';
 import { nodeIdFromPoint, pasteDropPaths } from '../lib/fileDropPaste';
 import { useAsyncEffect } from './useAsyncEffect';
 
@@ -46,7 +47,8 @@ export function useFileDropToTerminal(): void {
         if (nodeId === null || payload.paths.length === 0) return;
         const inst = terminalManager.getInstance(nodeId);
         if (!inst) return;
-        pasteDropPaths(inst.term, payload.paths).catch((err) =>
+        const node = useAgentNodeStore.getState().agentNodes.find((candidate) => candidate.id === nodeId);
+        pasteDropPaths(inst.term, payload.paths, node?.env ?? 'windows').catch((err) =>
           console.error('[useFileDropToTerminal] paste failed:', err),
         );
       })

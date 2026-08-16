@@ -1,4 +1,5 @@
 import * as api from './tauri';
+import type { EnvType } from '../types/generated/EnvType';
 
 /**
  * Pasting an OS file drop into an agent terminal.
@@ -27,14 +28,19 @@ export function quotePathIfNeeded(path: string): string {
  * ready to paste. `to_host_path` is a no-op for native paths and normalises
  * WSL/Git-Bash styles; quoting protects paths with spaces.
  */
-export async function resolveDropText(rawPaths: string[]): Promise<string> {
-  const hostPaths = await Promise.all(rawPaths.map((p) => api.toHostPath(p)));
-  return hostPaths.filter(Boolean).map(quotePathIfNeeded).join(' ');
+export async function resolveDropText(rawPaths: string[], env: EnvType): Promise<string> {
+  const convertPath = env === 'wsl' ? api.toGuestPath : api.toHostPath;
+  const resolvedPaths = await Promise.all(rawPaths.map((p) => convertPath(p)));
+  return resolvedPaths.filter(Boolean).map(quotePathIfNeeded).join(' ');
 }
 
 /** Resolve drop paths and paste them into the given terminal, then focus it. */
-export async function pasteDropPaths(target: PasteTarget, rawPaths: string[]): Promise<void> {
-  const text = await resolveDropText(rawPaths);
+export async function pasteDropPaths(
+  target: PasteTarget,
+  rawPaths: string[],
+  env: EnvType,
+): Promise<void> {
+  const text = await resolveDropText(rawPaths, env);
   if (!text) return;
   target.paste(text);
   target.focus();
