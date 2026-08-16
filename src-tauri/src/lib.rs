@@ -544,6 +544,7 @@ pub fn run() {
             commands::file_tree::open_in_file_manager,
             commands::file_tree::get_user_config_dir,
             commands::file_tree::to_host_path,
+            commands::file_tree::to_guest_path,
             // Git
             commands::git::get_git_status,
             commands::git::get_git_branch_status,

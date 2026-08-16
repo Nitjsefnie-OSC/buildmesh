@@ -96,6 +96,12 @@ pub fn to_host_path(path: String) -> String {
     env::to_host_path(&path)
 }
 
+/// Convert a host-native path to the WSL guest form for a WSL agent node.
+#[command]
+pub async fn to_guest_path(path: String) -> Result<String, String> {
+    crate::commands::run_blocking("to_guest_path", move || Ok(env::to_guest_path(&path))).await
+}
+
 /// Open a file in the system default editor (VS Code)
 // Offloaded via `run_blocking`: process creation on a loaded Windows box can
 // take tens of ms — cheap, but no reason to park a bounded tokio worker.
