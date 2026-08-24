@@ -4,23 +4,28 @@ name: CI for target ref
 # commit SHA; it resolves the input to the exact 40-character commit under
 # test, prints that SHA as a literal searchable provenance line in ordinary
 # job logs, and runs the repository's established frontend CI surface
-# (typecheck + full unit-test script) against that exact checkout.
+# (typecheck, mobile bundle build, full unit suite) against that exact
+# checkout. Unqualified names that exist as both a branch and a tag resolve
+# branch-first (actions/checkout precedence); use fully qualified
+# refs/heads/<name> or refs/tags/<name> to disambiguate such collisions.
 on:
   workflow_dispatch:
     inputs:
       target_ref:
-        description: "Branch, tag, or commit SHA to check out and test"
+        description: "Branch, tag, or commit SHA to check out and test; fully qualified refs (refs/heads/... or refs/tags/...) disambiguate branch/tag name collisions"
         required: true
         type: string
 
 permissions:
   contents: read
 
-# Re-dispatching the same target supersedes the older run; distinct targets
-# never cancel each other.
+# Verification runs must never cancel one another. GitHub concurrency groups
+# are case-insensitive, so keying on the raw ref spelling could cancel a
+# distinct ref differing only by case; equivalent spellings of one target do
+# not coalesce either. Every dispatch gets a unique, non-cancelling group.
 concurrency:
-  group: target-ci-${{ inputs.target_ref }}
-  cancel-in-progress: true
+  group: target-ci-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   target-ci:
@@ -57,14 +62,53 @@ jobs:
           node-version: "20"
           cache: "npm"
 
+      # --ignore-scripts: dependency lifecycle scripts come from the checked-
+      # out candidate and must never execute inside this verification wrapper.
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
+      # Exact-tree gate 1: dependency installation must not move HEAD or
+      # dirty the tracked worktree (staged or unstaged). The expected SHA is
+      # bound through a trusted environment value from the provenance step.
+      - name: Verify exact tree after dependency install
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.target.outputs.resolved_sha }}
+        run: |
+          set -euo pipefail
+          HEAD_NOW="$(git rev-parse HEAD)"
+          test "$HEAD_NOW" = "$EXPECTED_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          echo "TREE-INTACT-AFTER-INSTALL: $HEAD_NOW"
+
+      # Direct typecheck; --no-install keeps npx from substituting anything
+      # beyond the installed dependency tree.
       - name: Typecheck frontend
-        run: npx tsc --noEmit
+        run: npx --no-install tsc --noEmit
 
-      # The repository's own unit-test script, unfiltered: no test-path
-      # argument through which a dispatched ref could narrow or skip the
-      # suite.
+      # Established mobile bundle build, invoked as the concrete underlying
+      # command of the repository's package.json "build:mobile" entry so the
+      # candidate's scripts block cannot redefine or skip it.
+      - name: Build mobile bundle
+        run: npx --no-install vite build --mode mobile
+
+      # Full unit suite, invoked as the concrete underlying command of the
+      # repository's package.json "test:unit" entry for the same reason: no
+      # candidate-redefinable script and no test-path narrowing.
       - name: Unit tests
-        run: npm run test:unit
+        run: npx --no-install vitest run tests/unit
+
+      # Exact-tree gate 2: validation steps must not have moved HEAD or
+      # dirtied the tracked worktree (staged or unstaged).
+      - name: Verify exact tree after validation
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.target.outputs.resolved_sha }}
+        run: |
+          set -euo pipefail
+          HEAD_NOW="$(git rev-parse HEAD)"
+          test "$HEAD_NOW" = "$EXPECTED_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+          echo "TREE-INTACT-AFTER-VALIDATION: $HEAD_NOW"
