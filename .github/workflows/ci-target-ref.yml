@@ -1,0 +1,70 @@
+name: CI for target ref
+
+# Generic exact-ref CI wrapper. Dispatched manually with any branch, tag, or
+# commit SHA; it resolves the input to the exact 40-character commit under
+# test, prints that SHA as a literal searchable provenance line in ordinary
+# job logs, and runs the repository's established frontend CI surface
+# (typecheck + full unit-test script) against that exact checkout.
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Branch, tag, or commit SHA to check out and test"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Re-dispatching the same target supersedes the older run; distinct targets
+# never cancel each other.
+concurrency:
+  group: target-ci-${{ inputs.target_ref }}
+  cancel-in-progress: true
+
+jobs:
+  target-ci:
+    name: Target CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      # Provenance: resolve whatever ref syntax was supplied to the exact
+      # commit under test and print it as a literal, greppable log line. The
+      # untrusted input reaches the shell only through an environment
+      # variable, never through direct interpolation.
+      - name: Resolve exact target SHA and print provenance
+        id: target
+        shell: bash
+        env:
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          RESOLVED="$(git rev-parse HEAD)"
+          test "${#RESOLVED}" -eq 40
+          echo "resolved_sha=$RESOLVED" >> "$GITHUB_OUTPUT"
+          echo "CI-TARGET-SHA: $RESOLVED"
+          echo "CI-TARGET-REF-INPUT: $TARGET_REF_INPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npx tsc --noEmit
+
+      # The repository's own unit-test script, unfiltered: no test-path
+      # argument through which a dispatched ref could narrow or skip the
+      # suite.
+      - name: Unit tests
+        run: npm run test:unit
