@@ -286,6 +286,63 @@ remembering:
 - `Direct` — the provider ships a native executable. The plain terminal
   harness is one of these: it *is* the terminal, so there is nothing to wrap.
 
+A Windows-runtime node whose directory lives in WSL spawns with a UNC current
+directory, and **cmd.exe rejects one** — it silently starts in `C:\Windows`
+instead. `Cmd` answers that with its own `pushd`, which maps the share for the
+lifetime of that shell. `PowerShell` has the same problem for a different
+reason: it cannot run a `.cmd`/`.bat` shim at all, so it delegates to
+`cmd.exe /c` and lands straight back on the rejection. So when the spawn is a
+batch shim in a UNC directory, the PowerShell arm runs *inside* cmd's `pushd`:
+`cmd.exe /d /c <temp-batch.cmd>`, where the batch reads the directory from a
+`BUILDMESH_SPAWN_DIR` environment variable and `pushd`s it before invoking the
+same `-EncodedCommand` payload. The agent's argv stays in that Base64 payload,
+so none of it crosses cmd's tokenizer.
+
+The decision is taken from the command and never by probing the filesystem: on
+the `WindowsInterop` arm Buildmesh runs on the Linux host, so a Windows path is
+not on a filesystem it can see and a probe would silently decline. A `.exe` or a
+bare stem is launched by PowerShell itself and never reaches cmd.exe, so it
+needs no mapping — which also leaves a drive-letter directory, a `.exe`, and a
+bare stem on today's behaviour, and keeps any host PowerShell execution policy
+out of the picture entirely.
+
+Two mechanical traps in that mapping, both learned the hard way:
+
+- **The directory must never appear on a command line.** portable-pty quotes an
+  argument only when it contains whitespace or a quote, so `&`, `|`, `<`, `>`,
+  `^`, `(`, `)` and `%` in a node's directory reach cmd.exe bare, where cmd
+  treats them as operators — a node in `R&D` would run whatever followed the
+  ampersand. Quoting inside the argument is not available either, because
+  portable-pty escapes a `"` inside an argument, so a pre-quoted path arrives as
+  `"\"<unc>\""` and `pushd` rejects the line with *The filename, directory name,
+  or volume label syntax is incorrect.* The mapping therefore runs from a
+  one-shot batch file that expands a `BUILDMESH_SPAWN_DIR` environment variable
+  inside quotes, so the only thing on the command line is the batch file's own
+  path. The `Cmd` arm still passes its UNC path as a plain argument and keeps
+  that exposure; see [`needs_unc_pushd`] in the module for why it is out of scope
+  for this change.
+
+On `WindowsInterop` the batch file crosses the WSL boundary and needs three
+things the native arm does not: a **Windows-visible** directory to live in
+(`std::env::temp_dir()` on the Linux host is the guest's `/tmp`), the node
+directory forwarded through `WSLENV`, and a fail-closed guard, because a batch
+expands an unset variable to nothing and `pushd ""` succeeds. The last one is
+what turns a forwarding regression from a failure into a silent wrong-directory
+spawn.
+
+The same split governs the batch file's own path: written through the host
+spelling of a Windows directory (`/mnt/c/...`), because that is how Linux opens
+it, but handed to `cmd.exe` in the Windows spelling (`C:\...`), because that is
+how Windows resolves it. `windows_cli_home` returns the host spelling — correct
+for opening a file, wrong for telling Windows where it is.
+- **Only a mapped spawn drops its working directory.** Handing cmd.exe the UNC
+  anyway prints *Defaulting to Windows directory* and makes a correct spawn look
+  broken. But `Direct` never establishes a location, and PowerShell running a
+  `.exe` or bare stem neither `pushd`s nor `Set-Location`s — suppressing the cwd
+  for those arms makes `portable-pty` fall back to `USERPROFILE` and opens the
+  agent in the home folder. All three sites read one decision,
+  `maps_directory_with_pushd`, because they have to agree.
+
 Read the adapter rather than trusting any list, including this one; a per-adapter
 table rots silently as adapters are added, which is why the adapter is the only
 place that decides and its own unit test is what pins the value.
