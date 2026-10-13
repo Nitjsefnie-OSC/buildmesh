@@ -1,3 +1,124 @@
+#[test]
+fn minimax_stop_uses_canonical_background_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("messages.jsonl");
+    let launch = serde_json::json!({"message":{"role":"toolResult","timestamp":100,
+        "details":{"status":"auto_promoted","task_id":"bg_owned"},"content":[]}})
+    .to_string();
+    for compatible_path in [
+        None,
+        Some("".to_owned()),
+        Some(
+            dir.path()
+                .join("expired.compatible.jsonl")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        ),
+    ] {
+        let mut stop =
+            serde_json::json!({"hook_event_name":"Stop", "session_id":"mvs_owned", "cwd":"repo"});
+        if let Some(path) = compatible_path {
+            stop["transcript_path"] = path.into();
+        }
+        let normalize = || {
+            normalizers::normalize(Some(&stop), "mcode", |_| {
+            crate::services::transcript_reader::adapters::mcode::count_pending_background_tasks_in(
+                &transcript,
+                &dir.path().join("tasks"),
+            )
+        })
+        .classified
+        .decision
+        };
+        std::fs::write(&transcript, &launch).unwrap();
+        assert_eq!(normalize(), Decision::SuppressPendingBackground);
+        let terminal = serde_json::json!({"message":{"role":"toolResult","timestamp":200,
+        "details":{"status":"succeeded","task_id":"bg_owned"},"content":[]}})
+        .to_string();
+        std::fs::write(&transcript, format!("{launch}\n{terminal}")).unwrap();
+        assert_eq!(normalize(), Decision::Ready);
+        std::fs::write(&transcript, "{partial").unwrap();
+        assert_eq!(normalize(), Decision::MarkInput);
+    }
+}
+
+#[test]
+fn minimax_stop_waits_for_pending_foreground_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("messages.jsonl");
+    let stop = serde_json::json!({"hook_event_name":"Stop",
+        "session_id":"mvs_0123456789abcdef0123456789abcdef", "cwd":"repo"});
+    let normalize = || {
+        normalizers::normalize(Some(&stop), "mcode", |_| {
+            crate::services::transcript_reader::adapters::mcode::count_pending_background_tasks_in(
+                &transcript,
+                &dir.path().join("tasks"),
+            )
+        })
+        .classified
+    };
+    let background = concat!(
+        "{\"message\":{\"role\":\"toolResult\",\"timestamp\":100,\"details\":{\"status\":\"auto_promoted\",\"task_id\":\"bg_settled\"},\"content\":[]}}\n",
+        "{\"message\":{\"role\":\"toolResult\",\"timestamp\":200,\"details\":{\"status\":\"succeeded\",\"task_id\":\"bg_settled\"},\"content\":[]}}\n"
+    );
+    let call = serde_json::json!({"message":{"role":"assistant","timestamp":300,
+        "content":[{"type":"toolCall","id":"foreground","name":"bash","arguments":{}}]}});
+    let unrelated = serde_json::json!({"message":{"role":"toolResult","timestamp":400,
+        "toolCallId":"unrelated","content":[]}});
+    let matched = serde_json::json!({"message":{"role":"toolResult","timestamp":500,
+        "toolCallId":"foreground","content":[]}});
+    for prefix in [background, ""] {
+        let pending = format!("{prefix}{call}\n");
+        std::fs::write(&transcript, &pending).unwrap();
+        let classified = normalize();
+        assert_eq!(classified.decision, Decision::MarkInput);
+        assert_eq!(
+            classified.detail.kind,
+            Some(LifecycleKind::SignalUnavailable)
+        );
+        assert!(
+            classified.validated,
+            "an unavailable read retains the Stop's identity and turn fence"
+        );
+
+        std::fs::write(&transcript, format!("{pending}{unrelated}\n")).unwrap();
+        assert_eq!(normalize().decision, Decision::MarkInput);
+        std::fs::write(&transcript, format!("{pending}{unrelated}\n{matched}\n")).unwrap();
+        assert_eq!(normalize().decision, Decision::Ready);
+    }
+}
+
+#[test]
+fn minimax_first_stop_reads_the_ownership_resolved_session() {
+    let id = "mvs_0123456789abcdef0123456789abcdef";
+    let stop = serde_json::json!({"hook_event_name":"Stop", "session_id":id,
+        "cwd":"repo", "transcript_path":"compatible.jsonl"});
+    let session = normalizers::reconciliation_session_id(Some(&stop), "mcode", "");
+    let observed = normalizers::normalize(Some(&stop), "mcode", |_| {
+        assert_eq!(
+            session, id,
+            "first Stop must read its ownership-resolved canonical session"
+        );
+        Some(0)
+    });
+    assert_eq!(observed.classified.decision, Decision::Ready);
+    assert_eq!(
+        normalizers::reconciliation_session_id(Some(&stop), "mcode", "stored"),
+        "stored"
+    );
+    let invalid =
+        serde_json::json!({"hook_event_name":"Stop", "session_id":"untrusted", "cwd":"repo"});
+    assert_eq!(
+        normalizers::reconciliation_session_id(Some(&invalid), "mcode", ""),
+        ""
+    );
+    assert_eq!(
+        normalizers::reconciliation_session_id(Some(&stop), "anthropic", ""),
+        ""
+    );
+}
+
 fn apply_status_fixture(
     state: &mut crate::agent::hook_state::HookState,
     value: serde_json::Value,
