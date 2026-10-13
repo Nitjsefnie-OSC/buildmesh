@@ -912,6 +912,13 @@ Remote access is optional and off by default.
 4. Manage paired phones under **Authorized Devices**. Revoking a device closes
    its active connections and requires a new pairing.
 
+A phone that has a saved device token recovers on its own if it loses its
+session cookie: the app re-establishes the session and retries what you were
+doing, so the screen stays where it was. A phone without one — which includes
+any phone paired by scanning a QR code, because pairing hands the browser a
+cookie and nothing else — is shown the pairing screen instead. Pairing again is
+always required after you revoke a device or clear the browser's site data.
+
 The loopback listener stays plain HTTP for local agent hooks. LAN/VPN interfaces
 use HTTPS/WSS. The status panel lists the interfaces that are actually exposed;
 an enabled toggle with no exposed interface is not a usable phone connection.
