@@ -677,9 +677,85 @@ fn slug_with_retry_rejects_too_short() {
 }
 
 #[test]
-fn slug_with_retry_rejects_too_long() {
-    let err = slug_with_retry("one-two-three-four-five-six").unwrap_err();
-    assert!(err.contains("dash-separated tokens"));
+fn slug_with_retry_truncates_too_long() {
+    assert_eq!(
+        slug_with_retry("one-two-three-four-five-six").unwrap(),
+        "one-two-three-four-five"
+    );
+    // Seven words is past the prompt's own range, but the answer is already
+    // hyphen-joined, so it is a name and only its tail is over-long.
+    assert_eq!(
+        slug_with_retry("fix-rust-dead-code-warnings-raise-pr").unwrap(),
+        "fix-rust-dead-code-warnings"
+    );
+}
+
+#[test]
+fn slug_with_retry_truncates_at_the_character_cap() {
+    // Five words, 66 chars: the word-boundary cut keeps three whole words and
+    // never leaves a trailing hyphen.
+    let slug = slug_with_retry("extraordinarily-complicated-configuration-normalization-refactor")
+        .unwrap();
+    assert_eq!(slug, "extraordinarily-complicated-configuration");
+    assert!(slug.len() <= 50);
+    assert!(!slug.ends_with('-'));
+}
+
+#[test]
+fn slug_with_retry_collapses_empty_tokens_before_clamping() {
+    assert_eq!(
+        slug_with_retry("fix--rust--dead--code--warnings--raise--pr").unwrap(),
+        "fix-rust-dead-code-warnings"
+    );
+}
+
+#[test]
+fn slug_with_retry_still_rejects_prose() {
+    // Clamping is for length only: a response that is not slug-shaped must
+    // still spend an attempt so the backend gets another go.
+    for prose in [
+        "the task: improve auth flow",
+        "the task: improve auth flow and the tests too",
+    ] {
+        let err = slug_with_retry(prose).unwrap_err();
+        assert!(
+            err.contains("lowercase words joined by hyphens"),
+            "expected a shape rejection for: '{prose}', got: {err}"
+        );
+    }
+    let err = slug_with_retry("fix: it").unwrap_err();
+    assert!(err.contains("dash-separated tokens"), "got: {err}");
+}
+
+#[test]
+fn slug_with_retry_refuses_a_sentence_rather_than_truncating_it() {
+    // Nothing is trimmed out of the model's own words: dropping the tail of a
+    // sentence yields a plausible-looking name that describes nothing, whether
+    // the cut lands on the word count or on the character cap.
+    for sentence in [
+        "please rename it to fix auth flow",     // seven words
+        "could you please rename this node now", // seven words
+        "i think the best name would be tidy",   // eight words
+        // Five words, but 51 characters once joined: the word count alone lets
+        // this through, so only the cap refuses it.
+        "configuration refactor documentation should mention",
+    ] {
+        let err = slug_with_retry(sentence).unwrap_err();
+        assert!(
+            err.contains("lowercase words joined by hyphens"),
+            "expected a refusal for: '{sentence}', got: {err}"
+        );
+    }
+    // A word run inside the range is still normalised, including the ambiguous
+    // short ones — the boundary the user guide states.
+    assert_eq!(
+        slug_with_retry("fix auth token flow").unwrap(),
+        "fix-auth-token-flow"
+    );
+    assert_eq!(
+        slug_with_retry("please rename it").unwrap(),
+        "please-rename-it"
+    );
 }
 
 #[test]
