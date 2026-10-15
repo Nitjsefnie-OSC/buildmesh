@@ -3,6 +3,7 @@ package dev.buildmesh.remote
 import java.io.IOException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.delay
@@ -114,8 +115,20 @@ class BuildmeshApi(
 
     private fun ensureSuccess(response: Response) {
         if (response.code == 207) {
-            val partial = Json.parseToJsonElement(response.body!!.string()).obj()
-            throw ApiException(207, "Node ${partial.objectAt("node")?.number("id")} was imported, but could not start: ${partial.text("spawn_error")}. Check Work before retrying.")
+            // `peekBody`, not `body.string()`: inspecting the payload must not
+            // consume it. `json()` reads the body again on the way out, and a
+            // consumed stream fails with "closed" once the create outcome is
+            // allowed to fall through here (issue #2331 review).
+            val partial = Json.parseToJsonElement(response.peekBody(Long.MAX_VALUE).string()).obj()
+            // 207 is shared by two routes (issue #2331). import-and-resume
+            // answers it with a bare node plus `spawn_error`, and the caller in
+            // ResourceScreens catches the 207 to show that message. Create
+            // answers it with a typed `outcome`, which the caller must reach —
+            // throwing here would make its StartFailed branch unreachable and
+            // strand a node that was genuinely committed.
+            if (partial.text("outcome").isEmpty()) {
+                throw ApiException(207, "Node ${partial.objectAt("node")?.number("id")} was imported, but could not start: ${partial.text("spawn_error")}. Check Work before retrying.")
+            }
         }
         if (!response.isSuccessful) {
             val detail = runCatching { Json.parseToJsonElement(response.body!!.string()).obj().text("error") }.getOrDefault("")
@@ -189,13 +202,69 @@ fun inputBody(sequence: String): JsonObject {
 
 // A saved Launch Configuration row's `id` is the configuration's id, not a
 // Spawn Option, so it travels as `configuration_id` beside its own Spawn Option.
-fun createNodeBody(meshId: Long, option: JsonObject, prompt: String): JsonObject = buildJsonObject {
+//
+// Issue #2331 — `operationKey` is generated once per submitted idea and reused
+// for every retry of that submission. The desktop binds it to the node in the
+// same transaction as the INSERT, so a retry after a lost response returns the
+// *same* node instead of creating a second node, worktree, and process. The
+// value is opaque to the server: it only has to stay equal across retries.
+fun createNodeBody(meshId: Long, option: JsonObject, prompt: String, operationKey: String): JsonObject = buildJsonObject {
     val configuration = option.objectAt("configuration")
     put("mesh_id", meshId)
     put("provider", configuration?.text("spawn_option_id") ?: option.text("id"))
     configuration?.let { put("configuration_id", it.text("id")) }
     put("rows", 24); put("cols", 80)
+    put("operation_key", operationKey)
     if (prompt.isNotBlank()) put("prompt", prompt.trim())
+}
+
+/**
+ * A retry-safe client identity for one submitted idea.
+ *
+ * `UUID.randomUUID()` is available on every supported Android level; the
+ * desktop only compares this value for equality against its own ledger, so it
+ * is an idempotency token rather than a secret.
+ */
+fun newOperationKey(): String = UUID.randomUUID().toString()
+
+/**
+ * The honest result of one create-and-start attempt (issue #2331).
+ *
+ * The server may commit the node row and then fail to start the process, so the
+ * response is a typed outcome rather than a bare node. Branching on `outcome` —
+ * never on the HTTP status — is what keeps "created but not started" from being
+ * rendered as a running agent.
+ */
+sealed interface CreateNodeOutcome {
+    /** The node is committed and the agent is running. */
+    data class Active(val node: JsonObject) : CreateNodeOutcome
+
+    /** The node is committed but no process is running; it can be started. */
+    data class StartPending(val node: JsonObject, val reason: String) : CreateNodeOutcome
+
+    /** The node is committed but the start failed. */
+    data class StartFailed(val node: JsonObject, val startError: String) : CreateNodeOutcome
+}
+
+/**
+ * Read the create outcome off the wire body.
+ *
+ * `node` is required for every variant — that requirement is the whole point
+ * of the contract: a committed node always reaches the user. A body with an
+ * unrecognised `outcome` is a server newer than this client, so fail loudly
+ * rather than pretending nothing was created (which would invite a duplicate).
+ */
+fun readCreateNodeOutcome(body: JsonObject): CreateNodeOutcome = when (val outcome = body.text("outcome")) {
+    "active" -> CreateNodeOutcome.Active(requireNotNull(body.objectAt("node")) { "active outcome without a node" })
+    "start_pending" -> CreateNodeOutcome.StartPending(
+        requireNotNull(body.objectAt("node")) { "start_pending outcome without a node" },
+        body.text("reason").ifEmpty { "The agent was created but not started." },
+    )
+    "start_failed" -> CreateNodeOutcome.StartFailed(
+        requireNotNull(body.objectAt("node")) { "start_failed outcome without a node" },
+        body.text("start_error").ifEmpty { "The agent could not be started." },
+    )
+    else -> error("Unsupported create outcome '$outcome'; update the app.")
 }
 
 // Issue spawn and archive resume accept a Spawn Option only; they have no

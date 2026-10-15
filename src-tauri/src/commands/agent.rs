@@ -623,8 +623,10 @@ pub(crate) fn create_issue_node_impl(
         true, // pending — Pending matches the prior create_pending(...) semantics
         configuration.as_ref(),
         Some(prefill.as_str()),
+        /* operation = */ None,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?
+    .node;
 
     Ok((IssueNodeDraft { node, prefill }, intent))
 }
@@ -1773,8 +1775,10 @@ mod tests {
             /* pending = */ true,
             /* configuration = */ None,
             /* initial_prompt = */ None,
+            /* operation = */ None,
         )
-        .expect("create pending node");
+        .expect("create pending node")
+        .node;
         (_tmp, node.id)
     }
 
