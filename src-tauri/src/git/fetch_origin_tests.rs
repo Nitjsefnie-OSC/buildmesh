@@ -220,7 +220,13 @@ fn fetch_origin_reports_repo_unusable_for_non_repo() {
     std::fs::write(parent.join("not-a-repo.txt"), "x").unwrap();
 
     let outcome = fetch_origin(parent.to_str().unwrap(), "origin/main");
-    assert!(matches!(outcome, Err(FetchError::RepoUnusable(_))));
+    // Never a repo, so the open fails before anything runs: `fetch_completed`
+    // must be false, or the spawn path would stamp this mesh as freshly
+    // fetched when no fetch ever happened.
+    assert!(matches!(
+        outcome,
+        Err(FetchError::RepoUnusable { fetch_completed: false, .. })
+    ));
 }
 
 /// E2E (no network): a clean repo with a local "remote" that has
@@ -729,6 +735,26 @@ fn fetch_outcome_advanced_ref_table() {
     assert!(!SkippedNoRemote.advanced_ref());
 }
 
+/// A repo that becomes unopenable AFTER the fetch completed still refreshed
+/// upstream. The spawn path stamps the per-Mesh freshness registry from this
+/// predicate, so dropping the fact here would make the next spawn within the TTL
+/// re-fetch a remote that was already current.
+#[test]
+fn fetch_error_fetched_ok_is_true_after_a_completed_fetch() {
+    use crate::git::sync::FetchError;
+    assert!(FetchError::RepoUnusable {
+        reason: "repo went away mid-sync".into(),
+        fetch_completed: true
+    }
+    .fetched_ok());
+    assert!(!FetchError::RepoUnusable {
+        reason: "not a repository".into(),
+        fetch_completed: false
+    }
+    .fetched_ok());
+    assert!(!FetchError::FetchFailed("network down".into()).fetched_ok());
+}
+
 /// Pin the `SyncOutcome::advanced_ref()` truth table. `pub(crate)` — the
 /// manual `git_sync` Tauri command is the only consumer. The two
 /// error-shaped variants (`FetchFailed`, `RepoUnusable`) must return
@@ -751,7 +777,64 @@ fn sync_outcome_advanced_ref_table() {
     assert!(!UpToDate.advanced_ref());
     assert!(!SkippedNoRemote.advanced_ref());
     assert!(!FetchFailed { reason: "x".into() }.advanced_ref());
-    assert!(!RepoUnusable { reason: "x".into() }.advanced_ref());
+    assert!(!RepoUnusable {
+        reason: "x".into(),
+        fetch_completed: false
+    }
+    .advanced_ref());
+    assert!(!RepoUnusable {
+        reason: "x".into(),
+        fetch_completed: true
+    }
+    .advanced_ref());
+    // The count-behind produced no number, so we do not know whether new
+    // commits arrived. Resetting the warm pool onto an unconfirmed SHA is the
+    // phantom advance PullTimedOut avoids, so this stays false.
+    assert!(!ComparisonFailed { reason: "x".into() }.advanced_ref());
+}
+
+/// Pin the `SyncOutcome::fetched_ok()` truth table — the predicate the
+/// per-Mesh freshness stamp keys on. It answers a different question from
+/// `advanced_ref`: did the fetch reach the remote and move the
+/// remote-tracking refs? A comparison failure answers TRUE here (the fetch
+/// ran) while answering FALSE to `advanced_ref` (we never learned whether
+/// commits arrived), and keeping those two apart is the whole point of having
+/// both.
+#[test]
+fn sync_outcome_fetched_ok_table() {
+    use crate::git::sync::SyncOutcome::*;
+    assert!(UpToDate.fetched_ok());
+    assert!(Synced { new_commits: 1 }.fetched_ok());
+    assert!(FetchedButDiverged {
+        new_commits: 1,
+        reason: "x".into()
+    }
+    .fetched_ok());
+    assert!(FetchedButDirty {
+        new_commits: 1,
+        blocking_paths: vec!["README.md".into()]
+    }
+    .fetched_ok());
+    assert!(PullTimedOut {
+        new_commits: 1,
+        reason: "x".into()
+    }
+    .fetched_ok());
+    assert!(ComparisonFailed { reason: "x".into() }.fetched_ok());
+    assert!(!SkippedNoRemote.fetched_ok());
+    assert!(!FetchFailed { reason: "x".into() }.fetched_ok());
+    assert!(!RepoUnusable {
+        reason: "x".into(),
+        fetch_completed: false
+    }
+    .fetched_ok());
+    // Re-opening the repo for the count-behind can fail AFTER the fetch
+    // completed. The freshness stamp must follow the fetch, not the reopen.
+    assert!(RepoUnusable {
+        reason: "x".into(),
+        fetch_completed: true
+    }
+    .fetched_ok());
 }
 
 // ── 2026-07-17 incident — URL-only remote (no fetch refspec) ────────────────

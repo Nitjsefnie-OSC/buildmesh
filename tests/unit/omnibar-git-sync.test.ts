@@ -1,0 +1,255 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { invoke } from '@tauri-apps/api/core';
+import { gitSyncAllMeshes } from '../../src/components/CommandOmnibar/omnibarActions';
+import { needsAttention } from '../../src/lib/notifications';
+import { SYNC_PROVIDER, useMeshSyncCompletion } from '../../src/lib/meshSyncFeedback';
+import { useToastStore } from '../../src/stores/toastStore';
+import type { GitSyncResult } from '../../src/types/generated/GitSyncResult';
+import type { Mesh } from '../../src/types/generated/Mesh';
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
+
+function mesh(id: number, name: string): Mesh {
+  return { id, name, path: `/repos/${name}`, layout: 'single', position: 0, created_at: '2026-01-01', base_ref: 'main' };
+}
+
+function sync(message: string, overrides: Partial<GitSyncResult> & Pick<GitSyncResult, 'status'>): GitSyncResult {
+  return { fetched: true, pulled: false, new_commits: 0, message, ...overrides };
+}
+
+beforeEach(() => {
+  vi.mocked(invoke).mockReset();
+  useToastStore.setState({ toasts: [], notifications: [], worktreeRevision: 0, cleanupError: null, cleanupLoading: false });
+  useMeshSyncCompletion.setState({ completions: {} });
+});
+
+describe('omnibar Git sync across meshes', () => {
+  it('confirms the whole run when every mesh syncs', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('Already up to date', { status: 'up_to_date' }));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    const toasts = useToastStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toMatchObject({ provider: SYNC_PROVIDER, severity: 'success' });
+    expect(toasts[0].message).toBe('Synced 2 of 2 meshes');
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(0);
+  });
+
+  it('leads with the synced count even when another mesh failed', async () => {
+    // The regression this pins: a run that fetched and fast-forwarded one mesh
+    // must not summarise as "Sync incomplete for: b" — that reads as if nothing
+    // was updated, which is the one conclusion the summary must not support.
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => ((args as { path: string }).path === '/repos/a'
+      ? sync('Pulled 1 new commit', { status: 'synced', pulled: true, new_commits: 1 })
+      : sync('Fetch failed: network down', { status: 'failed', fetched: false })));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    const [toast] = useToastStore.getState().toasts;
+    expect(toast.message).toBe('Synced 1 of 2 meshes — b');
+    expect(toast.severity).toBe('warning');
+  });
+
+  it('says nothing synced when a failure leaves the rest with nothing to do', async () => {
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => ((args as { path: string }).path === '/repos/a'
+      ? sync('Fetch failed: network down', { status: 'failed', fetched: false })
+      : sync('No remote configured', { status: 'skipped', fetched: false })));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    // Zero synced, and only one of the two was a failure — "Sync incomplete"
+    // alone would imply the other had synced.
+    const [toast] = useToastStore.getState().toasts;
+    expect(toast.message).toBe('No mesh synced — a; no remote: b');
+    expect(toast.severity).toBe('warning');
+  });
+
+  it('counts a fetched-but-not-fast-forwarded mesh as a problem, not a success', async () => {
+    // The bulk command used to count any resolved promise as success, so a
+    // mesh left behind upstream was reported as synced.
+    vi.mocked(invoke).mockResolvedValue(sync('Fetched 1 new commit but fast-forward failed: diverged', { status: 'partial' }));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    const attention = useToastStore.getState().notifications.filter(needsAttention);
+    expect(attention).toHaveLength(2);
+    expect(attention[0].action).toMatchObject({ meshName: expect.stringMatching(/^[ab]$/) });
+    // ONE toast for the whole run. Both meshes are behind, so the summary says
+    // so outright rather than implying some got through.
+    expect(useToastStore.getState().toasts).toHaveLength(1);
+    expect(useToastStore.getState().toasts[0].message).toBe('No mesh synced — a, b');
+  });
+
+  it('shows one toast for the run, not one per failing mesh', async () => {
+    // The failure mode this prevents: N problems each pushing a toast onto a
+    // three-deep stack, so the meshes the user most needs to know about are the
+    // ones whose toast has already expired.
+    vi.mocked(invoke).mockResolvedValue(sync('Fetch failed: network down', { status: 'failed', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b'), mesh(3, 'c'), mesh(4, 'd')]);
+
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(4);
+    const toasts = useToastStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toMatchObject({ provider: SYNC_PROVIDER, severity: 'warning' });
+    expect(toasts[0].message).toBe('No mesh synced — a, b, c, d');
+  });
+
+  it('reports a mesh with no remote as such, rather than synced', async () => {
+    // Nothing was contacted, so counting it as synced claims a result the run
+    // never obtained.
+    vi.mocked(invoke).mockResolvedValue(sync('No remote configured', { status: 'skipped', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    expect(useToastStore.getState().toasts[0].message).toBe('No mesh synced — no remote: a, b');
+    expect(useToastStore.getState().toasts[0].severity).toBe('info');
+  });
+
+  it('does not tell a fetched mesh it has no remote', async () => {
+    // A remote exists and was fetched; only the branch has no upstream. Saying
+    // "no remote" here would send the user looking for a remote they have.
+    vi.mocked(invoke).mockResolvedValue(sync('Fetched, but this branch has no upstream to compare against', { status: 'no_upstream', fetched: true }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+
+    expect(useToastStore.getState().toasts[0].message).toBe('No mesh synced — nothing to compare: a');
+    expect(useToastStore.getState().toasts[0].message).not.toContain('no remote');
+    // Still a normal case: no Needs-attention card for it.
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(0);
+  });
+
+  it('tells the two "nothing compared" cases apart in one run', async () => {
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => ((args as { path: string }).path === '/repos/a'
+      ? sync('No remote configured', { status: 'skipped', fetched: false })
+      : sync('Fetched, but this branch has no upstream', { status: 'no_upstream', fetched: true })));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    expect(useToastStore.getState().toasts[0].message).toBe('No mesh synced — no remote: a; nothing to compare: b');
+  });
+
+  it('counts skipped meshes separately when others really did sync', async () => {
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => ((args as { path: string }).path === '/repos/a'
+      ? sync('No remote configured', { status: 'skipped', fetched: false })
+      : sync('Pulled 1 new commit', { status: 'synced', pulled: true, new_commits: 1 })));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    // The successful meshes must be named too. A run that fetched and
+    // fast-forwarded mesh b is not "nothing happened", and a toast listing only
+    // the mesh with no remote says nothing about b at all.
+    expect(useToastStore.getState().toasts[0].message).toBe('Synced 1 of 2 meshes — no remote: a');
+  });
+
+  it('reports both kinds of nothing-to-do against the synced count', async () => {
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+      const { path } = args as { path: string };
+      if (path === '/repos/a') return sync('No remote configured', { status: 'skipped', fetched: false });
+      if (path === '/repos/b') return sync('Fetched, but this branch has no upstream', { status: 'no_upstream', fetched: true });
+      return sync('Pulled 1 new commit', { status: 'synced', pulled: true, new_commits: 1 });
+    });
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b'), mesh(3, 'c')]);
+
+    expect(useToastStore.getState().toasts[0].message)
+      .toBe('Synced 1 of 3 meshes — no remote: a; nothing to compare: b');
+  });
+
+  it('says plainly that nothing synced when every mesh had nothing to do', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('No remote configured', { status: 'skipped', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    expect(useToastStore.getState().toasts[0].message).toBe('No mesh synced — no remote: a, b');
+  });
+
+  it('names skipped meshes in the problem summary too', async () => {
+    // A skipped mesh raises no Needs-attention item, so a problem-only summary
+    // left the no-remote outcome reported nowhere at all.
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => ((args as { path: string }).path === '/repos/a'
+      ? sync('Fetch failed: network down', { status: 'failed', fetched: false })
+      : sync('No remote configured', { status: 'skipped', fetched: false })));
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    expect(useToastStore.getState().toasts).toHaveLength(1);
+    expect(useToastStore.getState().toasts[0].message)
+      .toBe('No mesh synced — a; no remote: b');
+    // One card for the one real problem; the no-remote mesh raises none.
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(1);
+  });
+
+  it('publishes a fetch for a mesh left partially synced', async () => {
+    // The bulk run advances the upstream ref without fast-forwarding, so the
+    // row's cached behind-count must be re-read even though nothing resolved.
+    vi.mocked(invoke).mockResolvedValue(sync('Fetched 9 new commits but fast-forward failed: diverged', { status: 'partial' }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+
+    expect(useMeshSyncCompletion.getState().completions['/repos/a'])
+      .toMatchObject({ verified: false, refsMayHaveChanged: true });
+  });
+
+  it('publishes a fetch for a mesh that fetched without being compared', async () => {
+    // The bulk path must publish the same outcomes the single-mesh path does.
+    // Skipping this one is how a `no_upstream` mesh kept a stale behind-count
+    // even though its remote-tracking ref had moved.
+    vi.mocked(invoke).mockResolvedValue(sync('Fetched, but this branch has no upstream', { status: 'no_upstream', fetched: true }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+
+    expect(useMeshSyncCompletion.getState().completions['/repos/a'])
+      .toMatchObject({ verified: false, refsMayHaveChanged: true });
+  });
+
+  it('publishes nothing for a mesh with no remote — no fetch was launched', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('No remote configured', { status: 'skipped', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+
+    expect(useMeshSyncCompletion.getState().completions['/repos/a']).toBeUndefined();
+  });
+
+  it('publishes nothing for a mesh that only skipped', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('No remote configured', { status: 'skipped', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+
+    expect(useMeshSyncCompletion.getState().completions['/repos/a']).toBeUndefined();
+  });
+
+  it('does not let a skipped mesh resolve an earlier real failure', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('Fetch failed: network down', { status: 'failed', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(1);
+
+    vi.mocked(invoke).mockResolvedValue(sync('No remote configured', { status: 'skipped', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(1);
+  });
+
+  it('keeps going after one mesh throws and reports it as a failure', async () => {
+    vi.mocked(invoke).mockImplementation(async (_cmd, args) => {
+      if ((args as { path: string })?.path === '/repos/a') throw new Error('command failed');
+      return sync('Pulled 1 new commit', { status: 'synced', pulled: true, new_commits: 1 });
+    });
+    await gitSyncAllMeshes([mesh(1, 'a'), mesh(2, 'b')]);
+
+    // Both meshes were attempted: the throw must not abort the rest. Counted
+    // per command because the IPC chokepoint also logs the rejection.
+    const syncs = vi.mocked(invoke).mock.calls.filter(c => c[0] === 'git_sync');
+    expect(syncs).toHaveLength(2);
+    const attention = useToastStore.getState().notifications.filter(needsAttention);
+    expect(attention).toHaveLength(1);
+    expect(attention[0].action).toMatchObject({ kind: 'mesh-sync-failure', meshName: 'a', detail: 'command failed' });
+  });
+
+  it('says nothing when there is no mesh to sync', async () => {
+    await gitSyncAllMeshes([]);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(useToastStore.getState().toasts).toHaveLength(0);
+  });
+
+  it('says nothing synced when every mesh failed', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('Fetch failed: network down', { status: 'failed', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+
+    expect(useToastStore.getState().toasts.at(-1)?.message).toBe('No mesh synced — a');
+  });
+
+  it('resolves a mesh that previously failed once it syncs cleanly', async () => {
+    vi.mocked(invoke).mockResolvedValue(sync('Fetch failed: network down', { status: 'failed', fetched: false }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(1);
+
+    vi.mocked(invoke).mockResolvedValue(sync('Pulled 1 new commit', { status: 'synced', pulled: true, new_commits: 1 }));
+    await gitSyncAllMeshes([mesh(1, 'a')]);
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(0);
+  });
+});

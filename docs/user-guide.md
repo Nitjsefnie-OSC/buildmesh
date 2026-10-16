@@ -425,6 +425,36 @@ agent. Right-click the card for Properties, File Explorer, Force sync from
 upstream, Archive, GitHub Issues, and — for a mesh with a GitHub origin — View
 on GitHub.
 
+Forcing a sync always reports back, one way or another. A toast says what
+happened: how many commits were pulled, that the mesh was already up to date,
+that this mesh has no remote configured, or that its branch has no upstream to
+compare against. Two of those are ordinary states rather than problems, and
+they get a toast only — **no card**. When the sync could not finish — the fetch
+failed, the fast-forward was refused because your local changes would be
+overwritten, your branch has diverged, the pull timed out, or the comparison
+against upstream failed — a card also appears in **Needs attention** in the
+Notifications probe (the bell in the title bar), naming the mesh, the reason,
+and its path. That card stays until a later sync succeeds, and its **Retry
+sync** button re-runs the sync for you.
+
+What the card claims depends on how far the sync got. Only one case supports a
+claim about being behind: the commits were fetched and the fast-forward did not
+apply, so the card says the mesh is behind. Everything else — the fetch failed
+partway, or the comparison itself failed — supports no claim at all, so the
+card says the upstream state is unknown. A failed fetch in particular does *not*
+mean upstream was never contacted: the sync was attempted, so the app will not
+tell you it wasn't.
+
+A pull that times out is the opposite case: the fetch already succeeded and the
+commits were counted, so the mesh really is behind and the card says so.
+
+A mesh whose sync could not finish also shows the sync retry icon next to its
+name, and that icon stays until a sync succeeds — click it to retry. It is
+separate from the `↓N` marker, which shows how far behind upstream the branch
+is and appears only when that number is above zero. After a failed fetch the
+count is whatever it was last known to be, so the two can disagree: the icon
+says the last sync did not finish, while `↓N` reports the last confirmed count.
+
 Meshes that currently have at least one open agent node sit at the top of
 the sidebar under an **Active** label, in your own drag order; every other
 mesh follows below, dimmed, in the same manual order. Nothing is hidden — all

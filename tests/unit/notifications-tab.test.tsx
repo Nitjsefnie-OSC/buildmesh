@@ -71,3 +71,157 @@ it('keeps read history after toast dismissal, clears it explicitly, and swaps wi
   fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
   expect(screen.queryByTestId('notifications-tab')).toBeNull();
 });
+
+// A mesh that never reached upstream and a worktree that cannot be removed are
+// unrelated problems with different recoveries, so they get different cards —
+// and only the sync card retries anything.
+describe('sync failures in Needs attention', () => {
+  const SYNC_ACTION = {
+    kind: 'mesh-sync-failure' as const, path: '/repos/mesh-a', meshName: 'mesh-a',
+    detail: 'Fetched 1 new commit but fast-forward failed: not possible to fast-forward',
+    evidence: 'behind',
+  };
+
+  it('names the mesh and its reason, and counts it as needing attention', async () => {
+    addToast('Git sync', 'mesh-a: Fetch failed', 'error', SYNC_ACTION);
+    render(<><NotificationButton /><ProbePanel /></>);
+    expect(screen.getByRole('button', { name: 'Open Notifications' }).title).toContain('1 need attention');
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+    const card = await screen.findByTestId('sync-attention-/repos/mesh-a');
+    expect(within(card).getByText('mesh-a')).toBeTruthy();
+    expect(within(card).getByText(/fast-forward failed/)).toBeTruthy();
+    expect(within(card).getByText('/repos/mesh-a')).toBeTruthy();
+    // Fetched, so upstream state is known and the mesh is genuinely behind.
+    expect(within(card).getByText('Behind upstream — the fetched commits were not applied')).toBeTruthy();
+  });
+
+  it('claims nothing about the position when the fetch did not complete', async () => {
+    // A failed fetch is NOT a fetch that never ran: Rust launches `git fetch`
+    // and reports the failure afterwards, so upstream may have been contacted.
+    // The card must not assert lag, and must not assert the opposite either —
+    // it supports no claim at all. This is the same wording the `unverified`
+    // and legacy-record cases render, which is the point: one honest reading
+    // for every "we don't know" outcome.
+    addToast('Git sync', 'mesh-a: Fetch failed: could not resolve host', 'error',
+      { ...SYNC_ACTION, detail: 'Fetch failed: could not resolve host', evidence: 'unknown' });
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+
+    const card = await screen.findByTestId('sync-attention-/repos/mesh-a');
+    expect(within(card).getByText('Upstream state unknown — this sync could not be verified')).toBeTruthy();
+    expect(within(card).queryByText(/Behind upstream/)).toBeNull();
+    expect(within(card).queryByText(/fetch did not run/)).toBeNull();
+  });
+
+  it('claims nothing when a fetch happened but the comparison failed', async () => {
+    // Fetched, so the refs moved — but nobody established where this mesh
+    // stands. Neither "behind" nor "the fetch did not run" is supported.
+    addToast('Git sync', 'mesh-a: could not compare with upstream', 'error',
+      { ...SYNC_ACTION, detail: 'Fetched, but could not compare with upstream: lock contention', evidence: 'unknown' });
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+
+    const card = await screen.findByTestId('sync-attention-/repos/mesh-a');
+    expect(within(card).getByText('Upstream state unknown — this sync could not be verified')).toBeTruthy();
+    expect(within(card).queryByText(/Behind upstream/)).toBeNull();
+    expect(within(card).queryByText(/fetch did not run/)).toBeNull();
+  });
+
+  it('claims nothing for a record written before the evidence field existed', async () => {
+    // A pre-`evidence` record may have been a fetched partial; it may equally
+    // have been a fetch that never ran. The stored record supports neither, so
+    // the card has to say so rather than pick the more alarming reading.
+    const legacy = { kind: 'mesh-sync-failure' as const, path: '/repos/mesh-a', meshName: 'mesh-a', detail: 'Fetch failed: network down' };
+    addToast('Git sync', 'mesh-a: Fetch failed: network down', 'error', legacy as typeof SYNC_ACTION);
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+
+    const card = await screen.findByTestId('sync-attention-/repos/mesh-a');
+    expect(within(card).getByText('Upstream state unknown — this sync could not be verified')).toBeTruthy();
+    expect(within(card).queryByText(/Behind upstream/)).toBeNull();
+    expect(within(card).queryByText(/fetch did not run/)).toBeNull();
+  });
+
+  it('disables Retry while a sync is in flight', async () => {
+    // The control must read as unavailable, not merely refuse clicks: the
+    // style rule keys off `disabled` (probe-ui-checklist §4), and a
+    // long-running action that stays visually prominent invites a double-click
+    // that fires two syncs.
+    let release: (v: unknown) => void = () => {};
+    vi.mocked(invoke).mockImplementation((cmd: string) => {
+      if (cmd === 'list_pending_worktree_removals') return Promise.resolve([entry]);
+      if (cmd === 'git_sync') return new Promise(resolve => { release = resolve; });
+      return Promise.resolve([]);
+    });
+    addToast('Git sync', 'mesh-a: Fetch failed', 'error', SYNC_ACTION);
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+
+    const retry = await screen.findByRole('button', { name: 'Retry sync for mesh-a' });
+    expect((retry as HTMLButtonElement).disabled).toBe(false);
+
+    fireEvent.click(retry);
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Retry sync for mesh-a' }) as HTMLButtonElement).disabled).toBe(true));
+    expect(screen.getByText('Retrying…')).toBeTruthy();
+
+    release({ fetched: true, pulled: true, new_commits: 2, message: 'Pulled 2 new commits', status: 'synced' });
+    await waitFor(() => expect(screen.queryByTestId('sync-attention-/repos/mesh-a')).toBeNull());
+  });
+
+  it('retries the sync from the card and clears it once the mesh syncs', async () => {
+    vi.mocked(invoke).mockImplementation(async cmd => {
+      if (cmd === 'list_pending_worktree_removals') return [entry];
+      if (cmd === 'git_sync') {
+        return { fetched: true, pulled: true, new_commits: 2, message: 'Pulled 2 new commits', status: 'synced' };
+      }
+      return [];
+    });
+    addToast('Git sync', 'mesh-a: Fetch failed', 'error', SYNC_ACTION);
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry sync for mesh-a' }));
+
+    await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith('git_sync', { path: '/repos/mesh-a' }));
+    // A successful retry is the resolution of the card it was clicked from —
+    // otherwise a fixed mesh stays in Needs attention forever.
+    await waitFor(() => expect(screen.queryByTestId('sync-attention-/repos/mesh-a')).toBeNull());
+    expect(screen.getByText(/Synced successfully\./)).toBeTruthy();
+  });
+
+  it('keeps the card and raises a new failure when the retry fails again', async () => {
+    vi.mocked(invoke).mockImplementation(async cmd => {
+      if (cmd === 'list_pending_worktree_removals') return [entry];
+      if (cmd === 'git_sync') {
+        return { fetched: false, pulled: false, new_commits: 0, message: 'Fetch failed: still down', status: 'failed' };
+      }
+      return [];
+    });
+    addToast('Git sync', 'mesh-a: Fetch failed', 'error', SYNC_ACTION);
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry sync for mesh-a' }));
+
+    // The 30-second worktree reconciliation also runs on mount; it must not
+    // resolve the sync card, or the failure would vanish on its own.
+    await waitFor(() => expect(screen.getByText(/still down/)).toBeTruthy());
+    expect(screen.getByTestId('sync-attention-/repos/mesh-a')).toBeTruthy();
+  });
+
+  it('offers a worktree recovery only for the worktree problem', async () => {
+    addToast('Git sync', 'mesh-a: Fetch failed', 'error', SYNC_ACTION);
+    await act(async () => reportBlockedWorktreeCleanup({
+      node_name: entry.node_name, worktree_path: entry.worktree_path, operation: entry.last_operation!,
+      error: entry.last_error!, attempt_count: 1, last_attempt_at: entry.last_attempt_at, retry_not_before: entry.retry_not_before,
+    }));
+    render(<><NotificationButton /><ProbePanel /></>);
+    fireEvent.click(screen.getByRole('button', { name: 'Open Notifications' }));
+
+    expect(await screen.findByRole('button', { name: 'Resolve worktree blocked' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Retry sync for mesh-a' })).toBeTruthy();
+    // Resolving the worktree must leave the sync card alone.
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve worktree blocked' }));
+    expect(await screen.findByRole('dialog')).toBeTruthy();
+    expect(screen.getByTestId('sync-attention-/repos/mesh-a')).toBeTruthy();
+  });
+});

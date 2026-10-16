@@ -64,17 +64,42 @@ pub enum FetchOutcome {
 /// Failure modes for `fetch_origin` that the caller should treat as
 /// "auto-sync unavailable, proceed with local HEAD anyway". The
 /// variants carry enough context to compose a user-readable toast.
+///
+/// `RepoUnusable` also carries whether the fetch had already completed when the
+/// repo became unopenable: `do_sync` fetches first and reopens the repo for the
+/// count-behind, and that reopen can be what fails. Dropping the fact here would
+/// make the spawn path stamp a mesh stale after a fetch that had just succeeded,
+/// and fetch it again for no reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchError {
     /// The path exists but isn't a git repository (or can't be
     /// opened as one). Unusual — a Mesh without a repo is a
     /// misconfiguration — but we still proceed to spawn since the
     /// agent's behaviour with a non-repo path is a separate concern.
-    RepoUnusable(String),
+    RepoUnusable {
+        reason: String,
+        /// True when this was returned after the fetch completed.
+        fetch_completed: bool,
+    },
     /// `git fetch` itself failed (most commonly: no network, DNS
     /// failure, or `origin` was removed between the no-remote check
     /// and the fetch). Carries stderr for the toast.
     FetchFailed(String),
+}
+
+impl FetchError {
+    /// The twin of [`FetchOutcome::fetched_ok`] for the error arm, so a sync
+    /// that fetched and then failed to read the result still counts as fresh.
+    /// Without it the spawn path would stamp such a mesh stale and re-fetch
+    /// upstream for no reason.
+    pub(crate) fn fetched_ok(&self) -> bool {
+        match self {
+            Self::RepoUnusable {
+                fetch_completed, ..
+            } => *fetch_completed,
+            Self::FetchFailed(_) => false,
+        }
+    }
 }
 
 impl FetchOutcome {
@@ -143,6 +168,26 @@ pub(crate) enum SyncOutcome {
     SkippedNoRemote,
     /// Fetched; no new commits to pull.
     UpToDate,
+    /// Fetched successfully, but the current branch has no upstream to
+    /// compare against, so nothing established how far behind it is. Common
+    /// cause: a branch that gained a remote via `git remote add` but has
+    /// never been pushed, so no tracking relationship exists.
+    ///
+    /// Distinct from [`UpToDate`], which asserts a comparison ran and found
+    /// zero: here no comparison was possible, so reporting "already up to
+    /// date" would be a claim we cannot support. Also distinct from
+    /// `SkippedNoRemote` — the fetch DID run, so the remote-tracking refs
+    /// are current.
+    NoUpstream,
+    /// Fetched successfully, but comparing the local branch against upstream
+    /// failed for a reason other than a missing upstream (perm denied on
+    /// .git/HEAD, corrupt object db, refdb lock contention). The fetch DID
+    /// happen — the remote-tracking refs are current — but the mesh's position
+    /// relative to upstream was never established, so this must not be
+    /// reported as `UpToDate`: that reads as "verified in sync", which would
+    /// resolve attention cards and clear failure badges for a mesh nobody
+    /// checked. Carries the git2 error.
+    ComparisonFailed { reason: String },
     /// Fetched and fast-forwarded `new_commits` commits onto the
     /// current branch.
     Synced { new_commits: u32 },
@@ -170,7 +215,16 @@ pub(crate) enum SyncOutcome {
     /// without a repo is a misconfiguration — but spawn / sync
     /// proceed anyway since the worker's behaviour on a non-repo
     /// path is a separate concern.
-    RepoUnusable { reason: String },
+    ///
+    /// `fetch_completed` separates the two ways this is returned: opening
+    /// the repo BEFORE the fetch fails (`false`), and re-opening it for the
+    /// count-behind AFTER a successful fetch fails (`true`). Without it the
+    /// caller cannot tell "nothing was fetched" from "fetched, then could not
+    /// read the result", and the first is what a stale marker would look like.
+    RepoUnusable {
+        reason: String,
+        fetch_completed: bool,
+    },
 }
 
 impl SyncOutcome {
@@ -182,17 +236,29 @@ impl SyncOutcome {
     /// after any of these outcomes is cut from up-to-date refs.
     ///
     /// `PullTimedOut` counts — the FETCH succeeded; only the working-tree
-    /// fast-forward hung. `Skipped*` do NOT count (no fetch ran), and the
-    /// two error variants obviously don't.
+    /// fast-forward hung. `ComparisonFailed` and `NoUpstream` count too: in
+    /// both the fetch succeeded and only the count-behind read failed to
+    /// produce a number. `SkippedNoRemote` does NOT count (no fetch ran), and
+    /// neither does `FetchFailed`. `RepoUnusable` depends on WHEN it was
+    /// returned: reopening the repo for the count-behind can fail after a
+    /// completed fetch, and the refs are current either way — stamping that
+    /// mesh stale because the *reader* failed would be exactly backwards.
     pub(crate) fn fetched_ok(&self) -> bool {
-        matches!(
-            self,
-            Self::UpToDate
-                | Self::Synced { .. }
-                | Self::FetchedButDiverged { .. }
-                | Self::FetchedButDirty { .. }
-                | Self::PullTimedOut { .. }
-        )
+        match self {
+            Self::RepoUnusable {
+                fetch_completed, ..
+            } => *fetch_completed,
+            other => matches!(
+                other,
+                Self::UpToDate
+                    | Self::ComparisonFailed { .. }
+                    | Self::NoUpstream
+                    | Self::Synced { .. }
+                    | Self::FetchedButDiverged { .. }
+                    | Self::FetchedButDirty { .. }
+                    | Self::PullTimedOut { .. }
+            ),
+        }
     }
 
     /// Same predicate as [`FetchOutcome::advanced_ref`] — the two enums
@@ -202,6 +268,13 @@ impl SyncOutcome {
     /// single-sourced (issue #634). Returns `false` for the two error-shaped
     /// variants (`FetchFailed`, `RepoUnusable`) — neither advanced the ref,
     /// and the caller can't usefully schedule a refresh pass on a failure.
+    /// `ComparisonFailed` also returns `false`, even though its fetch
+    /// succeeded: the count-behind produced no number, so we do not know
+    /// whether new commits arrived, and resetting the warm pool onto a SHA we
+    /// never confirmed is the phantom advance `PullTimedOut` avoids. The refs
+    /// are still fresh — that is `fetched_ok`'s job — but the pool must not
+    /// move. `NoUpstream` returns `false` for the same reason: no comparison
+    /// ran, so there is no confirmed new commit to move onto.
     pub(crate) fn advanced_ref(&self) -> bool {
         matches!(
             self,
@@ -228,10 +301,16 @@ impl SyncOutcome {
 ///    five-day-old SHA). Narrowing to one branch is the spawn-time
 ///    latency fix from `parse_branch_for_base_ref`; the manual
 ///    `git_sync` passes `None`.
-/// 4. **Count-behind** via [`commits_behind_upstream`]. Treats "no
-///    upstream" as `UpToDate` (most common cause: a fresh local-only
-///    branch that just gained a remote via `git remote add` but
-///    hasn't been pushed).
+/// 4. **Count-behind** via [`commits_behind_upstream`]. "No upstream
+///    configured" returns [`SyncOutcome::NoUpstream`], NOT `UpToDate`:
+///    `UpToDate` asserts a comparison ran and found zero commits behind, and
+///    nothing was compared here (most common cause: a fresh local-only branch
+///    that just gained a remote via `git remote add` but has not been pushed).
+///    Any other count-behind failure returns [`SyncOutcome::ComparisonFailed`]
+///    for the same reason. Only the spawn adapter folds either back into
+///    `FetchOutcome::UpToDate`, which has no card to get wrong — the manual
+///    `git_sync` result must not, or it resolves attention cards and clears
+///    failure badges for a mesh nobody compared.
 /// 5. **Clobber-check.** Compute [`primitives::ff_pull_blockers`] — the
 ///    locally dirty/untracked paths that the `HEAD..upstream`
 ///    fast-forward would overwrite, i.e. exactly the condition
@@ -291,8 +370,11 @@ pub(crate) fn do_sync(
     let repo = match super::project::open(host_path) {
         Ok(r) => r,
         Err(e) => {
+            // The fetch above completed, so the wire result must not claim
+            // otherwise — see `RepoUnusable::fetch_completed`.
             return SyncOutcome::RepoUnusable {
                 reason: e.to_string(),
+                fetch_completed: true,
             };
         }
     };
@@ -309,17 +391,25 @@ pub(crate) fn do_sync(
         Ok(n) => n,
         Err(e) => {
             if e.starts_with("no upstream") {
+                // The remote exists and was fetched, but this branch tracks
+                // nothing, so there is no comparison to make. That is a
+                // normal state for an unpushed branch — not an error, and not
+                // evidence of being up to date either.
                 tracing::info!(
-                    "do_sync: no upstream to compare against ({}); treating as up-to-date",
+                    "do_sync: no upstream to compare against ({}); nothing was compared",
                     e
                 );
-            } else {
-                tracing::warn!(
-                    "do_sync: failed to count commits behind upstream ({}); treating as up-to-date",
-                    e
-                );
+                return SyncOutcome::NoUpstream;
             }
-            return SyncOutcome::UpToDate;
+            // A real git2 error, not the benign "no upstream" case. The fetch
+            // already ran, so the refs are fresh — but "how far behind are we"
+            // is unknown, and reporting `UpToDate` here would assert it is
+            // zero. `ComparisonFailed` keeps that distinction on the wire.
+            tracing::warn!(
+                "do_sync: failed to count commits behind upstream ({}); fetch succeeded but the comparison is unverified",
+                e
+            );
+            return SyncOutcome::ComparisonFailed { reason: e };
         }
     };
     if new_commits == 0 {
@@ -463,6 +553,8 @@ pub(crate) fn do_fetch_only(
             );
             return Err(SyncOutcome::RepoUnusable {
                 reason: e.to_string(),
+                // Opened before the fetch ran — nothing has been fetched.
+                fetch_completed: false,
             });
         }
     };
@@ -811,7 +903,11 @@ pub fn fetch_origin(project_root: &str, base_ref: &str) -> Result<FetchOutcome, 
                 host_root,
                 e
             );
-            return Err(FetchError::RepoUnusable(e.to_string()));
+            return Err(FetchError::RepoUnusable {
+                reason: e.to_string(),
+                // Opened before anything ran — no fetch has completed.
+                fetch_completed: false,
+            });
         }
     };
 
@@ -848,6 +944,25 @@ pub fn fetch_origin(project_root: &str, base_ref: &str) -> Result<FetchOutcome, 
         },
         SyncOutcome::SkippedNoRemote => FetchOutcome::SkippedNoRemote,
         SyncOutcome::UpToDate => FetchOutcome::UpToDate,
+        // Same reasoning as `ComparisonFailed` below: the spawn path keeps
+        // the behaviour it had when both of these folded into `UpToDate` —
+        // the fetch ran, so `fetched_ok` stamps freshness, and no warning
+        // toast is raised. The spawn path has no card to get wrong.
+        SyncOutcome::NoUpstream => FetchOutcome::UpToDate,
+        // The spawn-time contract keeps the behaviour it had when this folded
+        // into `UpToDate`: fetch succeeded, so `fetched_ok` stamps freshness,
+        // and no warning toast is raised. `ComparisonFailed` exists for the
+        // MANUAL `git_sync` path, whose frontend turns a status into a
+        // "Needs attention" card and a resolution — "Already up to date" there
+        // would resolve cards for a mesh nobody compared. The spawn path has
+        // no such consumer and no card to get wrong.
+        SyncOutcome::ComparisonFailed { reason } => {
+            tracing::warn!(
+                "fetch_origin: {}; treating as up-to-date for the spawn path",
+                reason
+            );
+            FetchOutcome::UpToDate
+        }
         SyncOutcome::Synced { new_commits } => FetchOutcome::Synced { new_commits },
         SyncOutcome::FetchedButDiverged {
             new_commits,
@@ -871,7 +986,17 @@ pub fn fetch_origin(project_root: &str, base_ref: &str) -> Result<FetchOutcome, 
             }
         }
         SyncOutcome::FetchFailed { reason } => return Err(FetchError::FetchFailed(reason)),
-        SyncOutcome::RepoUnusable { reason } => return Err(FetchError::RepoUnusable(reason)),
+        SyncOutcome::RepoUnusable {
+            reason,
+            fetch_completed,
+        } => {
+            return Err(FetchError::RepoUnusable {
+                reason,
+                // Carried through so the spawn path can still stamp the fetch
+                // as having refreshed upstream — see `FetchError::fetched_ok`.
+                fetch_completed,
+            });
+        }
     })
 }
 
@@ -990,11 +1115,10 @@ pub async fn locked_fetch_origin(
             // Stamp the per-Mesh fetch-freshness registry from the bounded-
             // wait's outcome (ADR 0020): a spawn that won the lock and ran
             // the fetch must record both attempt + (when reached) success,
-            // matching the policy `stamp_fetch_freshness` enforces.
-            stamp_fetch_freshness(
-                &mesh_path,
-                &inner.as_ref().map(|o| o.fetched_ok()).unwrap_or(false),
-            );
+            // matching the policy `stamp_fetch_freshness` enforces. The error
+            // arm is consulted too — a repo that became unopenable after a
+            // completed fetch still refreshed upstream.
+            stamp_fetch_freshness(&mesh_path, &fetched_ok_of(inner));
         })
         .unwrap_or_else(|| {
             tracing::warn!(
@@ -1044,10 +1168,7 @@ pub fn locked_fetch_origin_blocking(
     let result = crate::services::sync_lock::with_mesh_sync_lock(mesh_path, || {
         fetch_origin(mesh_path, base_ref)
     });
-    stamp_fetch_freshness(
-        mesh_path,
-        &result.as_ref().map(|o| o.fetched_ok()).unwrap_or(false),
-    );
+    stamp_fetch_freshness(mesh_path, &fetched_ok_of(&result));
     result
 }
 
@@ -1062,6 +1183,20 @@ fn stamp_fetch_freshness(mesh_path: &str, fetched_ok: &bool) {
     if *fetched_ok {
         crate::services::fetch_freshness::note_success(mesh_path);
     }
+}
+
+/// Did the fetch complete, on either arm of a spawn-time sync?
+///
+/// Both locked wrappers need this, and getting it wrong on the error arm
+/// stamps a mesh stale after a fetch that had succeeded — so the answer lives
+/// in one place rather than being re-derived (and mis-defaulted) at each call
+/// site. Each arm's own `fetched_ok` carries the detail: `FetchOutcome` for a
+/// completed sync, `FetchError` for the case where the repo became unopenable
+/// after the fetch had already run.
+fn fetched_ok_of(result: &Result<FetchOutcome, FetchError>) -> bool {
+    result
+        .as_ref()
+        .map_or_else(FetchError::fetched_ok, FetchOutcome::fetched_ok)
 }
 
 #[cfg(test)]

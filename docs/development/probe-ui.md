@@ -77,14 +77,16 @@ Failed preferences disable writes, and retries/unmount invalidate stale reads.
 
 ## Notifications
 
-The Notifications Probe puts actionable worktree problems before recent toast
-activity. `toastStore.addToast` captures history in the same transition as the
-visible toast, before the three-toast cap. Dismissal and expiry affect the toast
-stack only. History and read state persist locally; the newest 100 ordinary or
-resolved records are retained alongside all unresolved worktree problems. Mark
-all read and Clear read preserve unresolved problems. The bell prioritizes an
-amber count of unresolved worktrees, otherwise an unread count. Storage failures
-retain the in-memory view.
+The Notifications Probe puts actionable problems before recent toast activity.
+`toastStore.addToast` captures history in the same transition as the visible
+toast, before the three-toast cap — unless the caller asks for a silent record
+(one summary toast instead of one per problem). Dismissal and expiry affect the
+toast stack only. History and read state persist locally; the newest 100
+ordinary or resolved records are retained alongside every unresolved actionable
+problem of any kind. Mark all read and Clear read preserve unresolved problems.
+The bell prioritizes an amber count of unresolved problems — blocked worktree
+cleanups and incomplete mesh syncs alike — otherwise an unread count. Storage
+failures retain the in-memory view.
 
 Worktree failure events record an actionable notification without opening the
 recovery dialog. Resolve refreshes the live queue and opens the existing cleanup
@@ -97,6 +99,60 @@ and fenced by a worktree revision so an older snapshot cannot hide a newer
 failure or resurrect a manual resolution. A read failure preserves last known
 problems and shows a retryable alert outside the scroller. Queue absence means
 only that cleanup is no longer pending, without claiming how it ended.
+
+Needs attention holds two kinds of unresolved problem, each with its own card
+and its own recovery, because the two problems are unrelated and are ended in
+different ways. A **blocked worktree cleanup** is the queue-backed kind: only the
+reconciliation may close it, so that inference is confined to
+`worktree-cleanup` actions and never touches another kind. A **mesh sync that did
+not complete** is the transient kind: `lib/meshSyncFeedback` classifies
+`GitSyncResult.status` into a toast severity, and `Partial`, `Unverified` and
+`Failed` — the three statuses that leave the mesh's position unresolved or
+unknown — raise an item whose Retry button re-runs the sync through the same
+path the sidebar uses. `Skipped` (no remote) and `NoUpstream` (a branch that
+tracks nothing) do neither: both are ordinary states that raise nothing, and
+neither resolves an earlier failure, because neither verified anything. Only a
+result that *verified* the mesh (`Synced`, `UpToDate`) closes its card, and its resolution deliberately does
+not bump the worktree revision, because it is not newer evidence about the queue.
+Both kinds deduplicate by action kind *and* path, since a mesh's root checkout
+can itself be a blocked worktree path.
+
+The sync card's outcome is read back by the sidebar rather than held in it. Each
+sync publishes two independent signals per mesh path — whether the mesh was
+verified, and whether the cached behind-count may be stale — and a mesh row
+applies each to the piece it owns: verification clears the failure badge, a
+possibly-stale count re-reads the branch status. The second signal is
+deliberately "may have changed", not "did": the manual fetch runs without
+`--atomic`, so it can update some remote-tracking refs before failing on
+another, leaving a `failed` result's count possibly stale. It is also true for a
+`failed` outcome that never launched a fetch at all (an unusable repository),
+because one redundant read is cheaper than trusting a flag that cannot make
+that promise. Only a mesh with no remote — where no
+fetch was launched at all — skips the refresh, so that publication is reserved
+for a provable no-op. The split is what a `Partial` run needs: it advances the
+remote-tracking ref without fast-forwarding, so the count is stale while the
+badge is correct. Both signals are applied by the same effect whether the sync
+was started from the row, from this probe's Retry button, or from the omnibar's
+bulk command — the bulk path publishes for the same outcomes the single-mesh
+path does, so the two cannot drift apart.
+
+What the card may *claim* is a third thing again, and the distinction is
+recorded per notification as `evidence`. A `partial` run establishes that the
+mesh is behind, so the card says so. Everything else establishes nothing either
+way — a fetch that did not complete, a comparison that could not be made, an
+IPC that rejected, a record written before the field existed — and the card
+says the state is unknown rather than choosing a reading. Note what is *not* a
+claim: `fetched: false` means the fetch did not complete, and it cannot say
+whether `git fetch` reached upstream, died mid-fetch, or was never spawned — so
+it settles nothing either way. Only `skipped` — no remote at all — proves
+nothing was fetched, and that one raises no card to make the claim.
+
+A command that syncs many meshes at once records its per-mesh problems silently
+— they land in Needs attention and nowhere else — and shows one summary toast,
+because N problem toasts would overflow the three-toast stack. That summary
+names the two kinds of nothing-to-do too, and keeps them apart: `no remote` and
+`nothing to compare` are different facts, and a mesh that has a remote must not
+be told it has none.
 
 The destination uses the standard Probe shell, tool rail and 240–720px resize
 bounds. Its toolbar and footer stay pinned around one inner scroller; diagnostic

@@ -6,8 +6,9 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import type { Mesh } from '../../stores/meshStore';
 import type { AgentNode } from '../../stores/agentNodeStore';
 import { getMeshColor } from '../../lib/meshColors';
-import { gitSync } from '../../lib/tauri';
 import type { MeshHealth } from '../../lib/tauri';
+import { runMeshSync, useMeshSyncCompletion } from '../../lib/meshSyncFeedback';
+import { useToastStore } from '../../stores/toastStore';
 import { listen } from '@tauri-apps/api/event';
 import { pathMatchesGitEvent } from '../../lib/paths';
 import type { MeshSyncWarningPayload } from '../../types/generated/MeshSyncWarningPayload';
@@ -268,11 +269,23 @@ function MeshItemView({
   // Failure-only sync indicator (no always-on button): syncs are automatic
   // (background sync per ADR 0020 + spawn-time auto-sync), so a permanent
   // header button duplicated the Regenerate icon for an action the user
-  // rarely needs. The badge appears ONLY when the backend reported a failed
-  // sync for this mesh — i.e. it may be going stale — and the card has no
-  // textual status line, so the badge is itself the retry affordance.
-  const [syncFailed, setSyncFailed] = useState(false);
+  // rarely needs. The badge appears ONLY when this mesh's sync state is
+  // unresolved — it may be going stale — and the card has no textual status
+  // line, so the badge is itself the retry affordance.
+  //
+  // Two independent sources light it, and it is the UNION of both:
+  //   - `spawnSyncFailed`: a `mesh-sync-warning` event from the automatic
+  //     spawn-time sync (local state, this component's own event subscription);
+  //   - `syncAttention`: an unresolved "Needs attention" item for this mesh.
+  // The second is read from the store rather than held locally because the
+  // user can now retry from the Notifications probe. A sync the row did not
+  // start still resolves that item, and a purely local flag would leave the
+  // badge lit next to a mesh that is demonstrably in sync.
+  const [spawnSyncFailed, setSpawnSyncFailed] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const syncAttention = useToastStore(s => s.notifications.some(n =>
+    n.action?.kind === 'mesh-sync-failure' && n.action.path === mesh.path && !n.action.resolution));
+  const syncFailed = spawnSyncFailed || syncAttention;
 
   // Light the failure icon only for THIS mesh: the event is app-global and
   // carries the mesh path that failed, so match through the same
@@ -283,7 +296,7 @@ function MeshItemView({
     let disposed = false;
     listen<MeshSyncWarningPayload>('mesh-sync-warning', (event) => {
       if (pathMatchesGitEvent({ path: event.payload.mesh_path }, mesh.path)) {
-        setSyncFailed(true);
+        setSpawnSyncFailed(true);
       }
     }).then((fn) => {
       // The mesh (or the whole sidebar) can unmount before the IPC-side
@@ -297,20 +310,51 @@ function MeshItemView({
     };
   }, [mesh.path]);
 
+  // A sync can be run from two places this row does not control — the
+  // Notifications probe's Retry button and the omnibar's bulk command — and
+  // both of the things this row owns are component-local: the spawn-warning
+  // flag above, and the behind-count cached by `useGitBranchStatus`. Reacting
+  // to the published outcome is what keeps a retry from the card from leaving
+  // a mesh that has moved showing a stale count, or a mesh that is in sync
+  // still showing a lit badge. The row's own retries publish the same outcome,
+  // so this is the only place either update happens.
+  //
+  // The two signals are applied separately on purpose. Verification ends the
+  // problem: it clears the badge. "The refs may have changed" ends staleness:
+  // it re-reads the behind-count. That one is deliberately pessimistic rather
+  // than a claim about what ran — a failed sync cannot say whether `git fetch`
+  // reached upstream, failed mid-flight, or was never spawned at all, and the
+  // manual fetch runs without `--atomic`, so a failure can leave some
+  // remote-tracking refs updated. Re-reading costs one IPC call; the ref this
+  // count is measured against having moved silently costs the user the truth.
+  // Only a provable no-fetch — a mesh with no remote — skips the
+  // refresh.
+  const completion = useMeshSyncCompletion(s => s.completions[mesh.path]);
+  const lastHandled = useRef(0);
+  useEffect(() => {
+    const revision = completion?.revision ?? 0;
+    if (revision === lastHandled.current) return;
+    lastHandled.current = revision;
+    if (completion?.verified) setSpawnSyncFailed(false);
+    if (completion?.refsMayHaveChanged) refreshBranchStatus();
+  }, [completion, refreshBranchStatus]);
+
   // One sync path behind both entry points: the failure badge in the header
-  // and "Force sync from upstream" in the context menu. A success clears the
-  // badge and recomputes the behind count (the pull may have advanced HEAD);
-  // a failure leaves the badge lit, which is the only feedback the card
-  // gives by design.
+  // and "Force sync from upstream" in the context menu. Both now report the
+  // outcome: `git_sync`'s result carries a status, so a toast always says what
+  // happened and a sync that left the mesh unresolved also raises a "Needs
+  // attention" item, which `syncAttention` above reads.
+  //
+  // This handler applies nothing itself. `runMeshSync` publishes the outcome and
+  // the completion effect above owns both the badge and the behind-count, so a
+  // retry started here and one started from the Notifications probe take the
+  // identical path — and a mesh with no remote, which publishes no completion,
+  // correctly costs no branch-status read.
   const handleSync = async () => {
     if (syncing) return;
     setSyncing(true);
     try {
-      await gitSync(mesh.path);
-      setSyncFailed(false);
-      refreshBranchStatus();
-    } catch (err) {
-      console.error('Sync failed:', err);
+      await runMeshSync({ name: mesh.name, path: mesh.path });
     } finally {
       setSyncing(false);
     }

@@ -666,6 +666,100 @@ mod tests {
         );
     }
 
+    /// Wire a bare "remote" at `remote_dir` to `repo_dir` as `origin`, so the
+    /// fetch path runs end-to-end with no network. `git remote add` creates no
+    /// tracking relationship, which is exactly the state under test.
+    fn add_origin_remote(repo_dir: &std::path::Path, remote_dir: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(remote_dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init --bare must succeed");
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", "origin", &remote_dir.to_string_lossy()])
+            .current_dir(repo_dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git remote add must succeed");
+    }
+
+    /// A repo whose branch has no upstream must NOT be reported as verified
+    /// up to date. `git_sync` resolves the remote to `origin` and fetches
+    /// successfully, so the fetch runs — and then the comparison cannot be
+    /// made, because the branch tracks nothing. Reporting `UpToDate` here
+    /// would read "a comparison ran and found zero commits behind", which
+    /// would resolve Needs-attention cards and clear failure badges for a
+    /// mesh nobody checked.
+    ///
+    /// This drives the real `git_sync` command over a real repo rather than
+    /// asserting on the mapping table: the bug being guarded lives in the
+    /// `do_sync` error branch, which a table test cannot reach.
+    #[tokio::test]
+    async fn git_sync_reports_a_branch_with_no_upstream_as_uncompared() {
+        use crate::commands::git::git_sync;
+        use crate::env::test_helpers::{init_repo_with_commit, TestDir};
+        let td = TestDir::new("git_sync_no_upstream");
+        let repo_dir = td.path();
+        init_repo_with_commit(repo_dir, &[("README.md", "x\n")]);
+        add_origin_remote(repo_dir, &td.sibling("origin"));
+
+        let result = git_sync(repo_dir.to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        assert_ne!(
+            result.status,
+            crate::commands::git::GitSyncStatus::UpToDate,
+            "an uncompared branch must not claim it was verified up to date (message: {})",
+            result.message
+        );
+        // The fetch did run, so the row's behind-count refresh still applies.
+        assert!(
+            result.fetched,
+            "the remote-tracking refs are current after the fetch"
+        );
+        assert!(!result.pulled);
+    }
+
+    /// A successful fetch followed by a comparison that cannot read HEAD must
+    /// surface as `Unverified`, not as "already up to date". The fetch ran, so
+    /// the refs are current — but nothing established the mesh's position.
+    ///
+    /// The failure is induced through the real command: an unborn HEAD makes
+    /// `commits_behind_upstream` fail with a non-"no upstream" error, which is
+    /// the branch that used to fold into `UpToDate`.
+    #[tokio::test]
+    async fn git_sync_reports_a_failed_comparison_as_unverified() {
+        use crate::commands::git::git_sync;
+        use crate::env::test_helpers::{init_repo_with_commit, TestDir};
+        let td = TestDir::new("git_sync_compare_fail");
+        let repo_dir = td.path();
+        init_repo_with_commit(repo_dir, &[("README.md", "x\n")]);
+        add_origin_remote(repo_dir, &td.sibling("origin"));
+        // Point HEAD at a branch that does not exist. The fetch does not read
+        // HEAD, so it still succeeds; the count-behind then cannot resolve a
+        // commit.
+        let status = std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD", "refs/heads/does-not-exist"])
+            .current_dir(repo_dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git symbolic-ref must succeed");
+
+        let result = git_sync(repo_dir.to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            crate::commands::git::GitSyncStatus::Unverified,
+            "a comparison that never ran must not read as up to date (message: {})",
+            result.message
+        );
+        assert!(result.fetched, "the fetch ran, so the refs are current");
+    }
+
     #[test]
     fn test_count_status_worktree_isolation() {
         let _repo = TempGitRepo::new();

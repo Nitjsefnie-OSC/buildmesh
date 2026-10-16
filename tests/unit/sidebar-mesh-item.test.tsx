@@ -18,6 +18,9 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { MeshItem } from '../../src/components/Sidebar/MeshItem';
+import { needsAttention } from '../../src/lib/notifications';
+import { reportMeshSync, useMeshSyncCompletion } from '../../src/lib/meshSyncFeedback';
+import { useToastStore } from '../../src/stores/toastStore';
 import type { Mesh } from '../../src/stores/meshStore';
 import type { AgentNode } from '../../src/stores/agentNodeStore';
 import type { SpawnOption } from '../../src/lib/groups';
@@ -185,6 +188,13 @@ describe('MeshItem', () => {
     // in the global setup only clears history, not implementation.
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockImplementation((_cmd: string) => Promise.resolve({}));
+    // The toast store is a module singleton and now receives a notification
+    // for every sync, so it has to be reset between tests or one test's sync
+    // failure is the next test's "Needs attention" item.
+    useToastStore.setState({ toasts: [], notifications: [], worktreeRevision: 0, cleanupError: null, cleanupLoading: false });
+    // Also the published-completion store: a test that leaves a completion
+    // behind would make the next test's row clear a badge it never lit.
+    useMeshSyncCompletion.setState({ completions: {} });
   });
 
   // RTL doesn't auto-unmount in this vitest setup, so the previous
@@ -468,7 +478,7 @@ describe('MeshItem', () => {
 
   it('retries the sync when the failure badge is clicked', async () => {
     vi.mocked(invoke).mockImplementation((cmd: string) =>
-      cmd === 'git_sync' ? Promise.resolve({ fetched: true, pulled: true, new_commits: 0, message: 'Already up to date' }) : Promise.resolve({}),
+      cmd === 'git_sync' ? Promise.resolve({ fetched: true, pulled: false, new_commits: 0, message: 'Already up to date', status: 'up_to_date' }) : Promise.resolve({}),
     );
     renderMeshItem();
     await act(async () => {
@@ -496,9 +506,9 @@ describe('MeshItem', () => {
   });
 
   it('keeps the failure badge lit when a retry fails', async () => {
-    // A failed retry is the only feedback the card gives (no textual
-    // status line), so the badge must survive it — clearing it here would
-    // leave a possibly-stale mesh looking fresh.
+    // A failed retry must leave the mesh looking not-in-sync: the badge is
+    // cleared only by a sync that actually completed, and the failure is also
+    // reported as a toast and a Needs-attention item (pinned below).
     vi.mocked(invoke).mockImplementation((cmd: string) =>
       cmd === 'git_sync' ? Promise.reject(new Error('fetch failed: network down')) : Promise.resolve({}),
     );
@@ -523,9 +533,8 @@ describe('MeshItem', () => {
     const badge = await screen.findByLabelText(/^Sync failed for /);
     await userEvent.click(badge);
 
-    // The rejected sync logs through `console.error`; the badge is the
-    // assertion. Re-enable the button (`disabled` while syncing) too, so
-    // the retry affordance is usable again.
+    // The rejected sync still leaves the badge lit; the retry affordance is
+    // usable again once the sync settles.
     await waitFor(() => expect(badge.hasAttribute('disabled')).toBe(false));
     expect(screen.getByLabelText(/^Sync failed for /)).toBe(badge);
   });
@@ -563,14 +572,104 @@ describe('MeshItem', () => {
     await userEvent.click(screen.getByText('Force sync from upstream'));
 
     // The menu closes on click (the sync runs in the sidebar row, not the
-    // menu). The card carries no textual status line any more, so the
-    // feedback surface after a force sync is the failure badge clearing —
-    // pinned in the test below.
+    // menu). The outcome is reported as a toast, pinned in the test below.
     expect(screen.queryByText('Force sync from upstream')).toBeNull();
     expect(vi.mocked(invoke)).toHaveBeenCalledWith('git_sync', { path: '/tmp/my-mesh' });
 
-    resolveSync({ fetched: true, pulled: true, new_commits: 3, message: 'Pulled 3 commits' });
+    resolveSync({ fetched: true, pulled: true, new_commits: 3, message: 'Pulled 3 new commits', status: 'synced' });
     await act(async () => {});
+  });
+
+  it('reports a successful force sync as a toast', async () => {
+    // The sync result used to be discarded, so a successful pull and a failed
+    // fetch were indistinguishable. The toast is the whole of that fix.
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === 'git_sync'
+        ? Promise.resolve({ fetched: true, pulled: true, new_commits: 3, message: 'Pulled 3 new commits', status: 'synced' })
+        : Promise.resolve({}),
+    );
+    renderMeshItem();
+    fireEvent.contextMenu(screen.getByText('my-mesh'));
+    await userEvent.click(screen.getByText('Force sync from upstream'));
+
+    await waitFor(() => expect(useToastStore.getState().toasts[0]?.message)
+      .toBe('my-mesh: Pulled 3 new commits'));
+    expect(useToastStore.getState().toasts[0].severity).toBe('success');
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(0);
+  });
+
+  it('raises a Needs-attention item when a force sync fetches but does not fast-forward', async () => {
+    // The reported field case: the commits arrive, the working tree does not
+    // move, so the behind marker stays — and the user is told why instead of
+    // finding an unchanged number after clicking Sync.
+    const detail = 'Fetched 1 new commit but fast-forward failed: not possible to fast-forward';
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === 'git_sync'
+        ? Promise.resolve({ fetched: true, pulled: false, new_commits: 1, message: detail, status: 'partial' })
+        : Promise.resolve({}),
+    );
+    renderMeshItem();
+    fireEvent.contextMenu(screen.getByText('my-mesh'));
+    await userEvent.click(screen.getByText('Force sync from upstream'));
+
+    await waitFor(() => expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(1));
+    expect(useToastStore.getState().notifications[0].action).toEqual({
+      kind: 'mesh-sync-failure', path: MESH.path, meshName: MESH.name, detail, evidence: 'behind',
+    });
+    expect(useToastStore.getState().toasts[0].severity).toBe('warning');
+  });
+
+  it('reports a force sync that the backend could not perform', async () => {
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === 'git_sync'
+        ? Promise.resolve({ fetched: false, pulled: false, new_commits: 0, message: 'Fetch failed: could not resolve host', status: 'failed' })
+        : Promise.resolve({}),
+    );
+    renderMeshItem();
+    fireEvent.contextMenu(screen.getByText('my-mesh'));
+    await userEvent.click(screen.getByText('Force sync from upstream'));
+
+    await waitFor(() => expect(useToastStore.getState().toasts[0]?.severity).toBe('error'));
+    expect(useToastStore.getState().toasts[0].message).toBe('my-mesh: Fetch failed: could not resolve host');
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(1);
+  });
+
+  it('does not raise a Needs-attention item for a mesh with no remote', async () => {
+    // A local-only Mesh is a valid setup: reporting it as a problem every sync
+    // would train the user to ignore the section.
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === 'git_sync'
+        ? Promise.resolve({ fetched: false, pulled: false, new_commits: 0, message: 'No remote configured', status: 'skipped' })
+        : Promise.resolve({}),
+    );
+    renderMeshItem();
+    fireEvent.contextMenu(screen.getByText('my-mesh'));
+    await userEvent.click(screen.getByText('Force sync from upstream'));
+
+    await waitFor(() => expect(useToastStore.getState().toasts).toHaveLength(1));
+    expect(useToastStore.getState().toasts[0].message).toBe('my-mesh: No remote configured');
+    expect(useToastStore.getState().notifications.filter(needsAttention)).toHaveLength(0);
+  });
+
+  it('costs no branch-status re-read for a mesh with no remote', async () => {
+    // No remote means no fetch was launched, so nothing can have moved the ref
+    // the behind-count is measured against. The row must not spend an IPC call
+    // re-reading it — the published outcome carries that decision, and an
+    // earlier `answered` flag re-read unconditionally.
+    vi.mocked(invoke).mockImplementation((cmd: string) =>
+      cmd === 'git_sync'
+        ? Promise.resolve({ fetched: false, pulled: false, new_commits: 0, message: 'No remote configured', status: 'skipped' })
+        : Promise.resolve({}),
+    );
+    renderMeshItem();
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length).toBeGreaterThan(0));
+    const readsBefore = vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length;
+
+    fireEvent.contextMenu(screen.getByText('my-mesh'));
+    await userEvent.click(screen.getByText('Force sync from upstream'));
+    await waitFor(() => expect(useToastStore.getState().toasts).toHaveLength(1));
+
+    expect(vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length).toBe(readsBefore);
   });
 
   it('clears the failure badge after a successful force sync', async () => {
@@ -578,7 +677,7 @@ describe('MeshItem', () => {
     // otherwise the user stays alarmed after the mesh is demonstrably
     // fresh again.
     vi.mocked(invoke).mockImplementation((cmd: string) =>
-      cmd === 'git_sync' ? Promise.resolve({ fetched: true, pulled: true, new_commits: 0, message: 'Already up to date' }) : Promise.resolve({}),
+      cmd === 'git_sync' ? Promise.resolve({ fetched: true, pulled: true, new_commits: 0, message: 'Pulled 0 new commits', status: 'synced' }) : Promise.resolve({}),
     );
     renderMeshItem();
     await act(async () => {
@@ -603,6 +702,140 @@ describe('MeshItem', () => {
     await userEvent.click(screen.getByText('Force sync from upstream'));
 
     await waitFor(() => expect(screen.queryByLabelText(/^Sync failed for /)).toBeNull());
+  });
+
+  it('clears the badge when a sync the row did not start is verified', async () => {
+    // The spawn-time warning and the row's cached behind-count are local to
+    // this component, so a retry run from the Notifications probe would leave
+    // both stale. The row reacts to the published completion instead.
+    renderMeshItem();
+    await act(async () => {
+      await emit('mesh-sync-warning', {
+        node_id: 10,
+        mesh_path: MESH.path,
+        outcome: 'fetch_failed',
+        new_commits: null,
+        pr_number: null,
+        head_ref: null,
+        expected_sha: null,
+        actual_sha: null,
+        fallback_base_ref: null,
+        head_repo_owner: null,
+        head_repo_clone_url: null,
+        message: 'fetch failed: network down',
+      });
+    });
+    await screen.findByLabelText(/^Sync failed for /);
+
+    const readsBefore = vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length;
+    await act(async () => { reportMeshSync({ name: MESH.name, path: MESH.path }, {
+      fetched: true, pulled: true, new_commits: 2, message: 'Pulled 2 new commits', status: 'synced',
+    }); });
+
+    await waitFor(() => expect(screen.queryByLabelText(/^Sync failed for /)).toBeNull());
+    // …and the behind-count is re-read, not left showing the pre-sync value.
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length)
+      .toBeGreaterThan(readsBefore));
+  });
+
+  it('refreshes the behind-count when a fetch the row did not start did not complete', async () => {
+    // `git fetch` runs without `--atomic`, so a failed fetch can update some
+    // remote-tracking refs before failing on another. The count is therefore
+    // possibly stale and must be re-read — even though the result reports
+    // `fetched: false`, which means "did not complete", not "moved nothing".
+    // The badge stays lit because nothing resolved this mesh — which is not the
+    // same as knowing it is behind.
+    renderMeshItem();
+    await act(async () => {
+      await emit('mesh-sync-warning', {
+        node_id: 10,
+        mesh_path: MESH.path,
+        outcome: 'fetch_failed',
+        new_commits: null,
+        pr_number: null,
+        head_ref: null,
+        expected_sha: null,
+        actual_sha: null,
+        fallback_base_ref: null,
+        head_repo_owner: null,
+        head_repo_clone_url: null,
+        message: 'fetch failed: network down',
+      });
+    });
+    await screen.findByLabelText(/^Sync failed for /);
+
+    const readsBefore = vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length;
+    await act(async () => { reportMeshSync({ name: MESH.name, path: MESH.path }, {
+      fetched: false, pulled: false, new_commits: 0, message: 'Fetch failed: could not resolve host', status: 'failed',
+    }); });
+
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length)
+      .toBeGreaterThan(readsBefore));
+    // The badge stays lit because nothing resolved this mesh — which is not
+    // the same as knowing it is behind, only that the state is unresolved.
+    expect(screen.getByLabelText(/^Sync failed for /)).toBeTruthy();
+  });
+
+  it('refreshes the behind-count when a sync the row did not start only fetched', async () => {
+    // A partial run advances the remote-tracking ref without fast-forwarding.
+    // The count is therefore stale — this is the originally reported symptom —
+    // while the badge is correct, because the mesh is still behind.
+    renderMeshItem();
+    await act(async () => {
+      await emit('mesh-sync-warning', {
+        node_id: 10,
+        mesh_path: MESH.path,
+        outcome: 'fetch_failed',
+        new_commits: null,
+        pr_number: null,
+        head_ref: null,
+        expected_sha: null,
+        actual_sha: null,
+        fallback_base_ref: null,
+        head_repo_owner: null,
+        head_repo_clone_url: null,
+        message: 'fetch failed: network down',
+      });
+    });
+    await screen.findByLabelText(/^Sync failed for /);
+
+    const readsBefore = vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length;
+    await act(async () => { reportMeshSync({ name: MESH.name, path: MESH.path }, {
+      fetched: true, pulled: false, new_commits: 9, message: 'Fetched 9 new commits but fast-forward failed: diverged', status: 'partial',
+    }); });
+
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(c => c[0] === 'get_git_branch_status').length)
+      .toBeGreaterThan(readsBefore));
+    // Still behind, so the badge stays lit — the fetch resolved nothing.
+    expect(screen.getByLabelText(/^Sync failed for /)).toBeTruthy();
+  });
+
+  it('keeps the badge lit when a sync the row did not start only skipped the mesh', async () => {
+    renderMeshItem();
+    await act(async () => {
+      await emit('mesh-sync-warning', {
+        node_id: 10,
+        mesh_path: MESH.path,
+        outcome: 'fetch_failed',
+        new_commits: null,
+        pr_number: null,
+        head_ref: null,
+        expected_sha: null,
+        actual_sha: null,
+        fallback_base_ref: null,
+        head_repo_owner: null,
+        head_repo_clone_url: null,
+        message: 'fetch failed: network down',
+      });
+    });
+    await screen.findByLabelText(/^Sync failed for /);
+
+    // A mesh with no remote was never contacted, so the earlier failure stands.
+    await act(async () => { reportMeshSync({ name: MESH.name, path: MESH.path }, {
+      fetched: false, pulled: false, new_commits: 0, message: 'No remote configured', status: 'skipped',
+    }); });
+
+    expect(screen.getByLabelText(/^Sync failed for /)).toBeTruthy();
   });
 
   // The card's header: dots + count (no textual status), the colour bar

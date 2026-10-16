@@ -1,7 +1,9 @@
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState, type ReactNode } from 'react';
 import { useToastStore } from '../../stores/toastStore';
 import { openBlockedCleanups, useBlockedCleanupStore } from '../../stores/blockedCleanupStore';
-import { needsAttention, type Notification } from '../../lib/notifications';
+import { isMeshSyncFailure, isWorktreeCleanup, needsAttention,
+  type MeshSyncNotificationAction, type Notification, type SyncEvidence, type WorktreeNotificationAction } from '../../lib/notifications';
+import { runMeshSync } from '../../lib/meshSyncFeedback';
 import { refreshWorktreeNotifications } from '../../lib/worktreeNotifications';
 import { ProbeTabBody } from './ProbeTabBody';
 import { BellIcon } from './probeIcons';
@@ -18,6 +20,92 @@ function NoticeTime({ notice }: { notice: Notification }) {
   </time>;
 }
 
+/** The layout every unresolved-problem card shares: a heading with its time, the
+ *  thing that needs attention, the reason, its path, and a status line beside the
+ *  one action that can move it. The two kinds differ only in what those slots
+ *  say and in which action they offer, so the structure lives here once — a card
+ *  whose reason does not wrap and a path that does not fit is the same bug in
+ *  both kinds. */
+function AttentionCard({ title, notice, subject, detail, path, status, action, testId }: {
+  title: string;
+  notice: Notification;
+  subject: string;
+  detail: string;
+  path: string;
+  status: string;
+  action: ReactNode;
+  testId?: string;
+}) {
+  return <article className="notification-attention-card" data-testid={testId}>
+    <div className="notification-heading"><h4>{title}</h4><NoticeTime notice={notice} /></div>
+    <div className="notification-node">{subject}</div>
+    <p>{detail}</p>
+    <code>{path}</code>
+    <div className="notification-card-actions"><span>{status}</span>{action}</div>
+  </article>;
+}
+
+/** What the card may assert, per what the record actually establishes. The
+ *  cases are genuinely different claims, not shades of one: a fetched run that
+ *  did not fast-forward knows the mesh is behind; `not-fetched` means the
+ *  record came from a mesh with no remote, where nothing was ever fetched (only
+ *  records written by earlier builds carry it, and it raises no card today);
+ *  and everything else establishes nothing either way — a fetch that did not
+ *  complete, a comparison that failed, an IPC that never returned — so the card
+ *  says so instead of picking the more alarming reading. */
+function syncStatusLine(evidence: SyncEvidence): string {
+  switch (evidence) {
+    case 'behind':
+      return 'Behind upstream — the fetched commits were not applied';
+    case 'not-fetched':
+      return 'Upstream not checked — the fetch did not run';
+    case 'unknown':
+    default:
+      // The `default` arm is load-bearing, not a formality: `evidence` is
+      // read out of persisted JSON, so a record written by an older build can
+      // arrive here with the field missing and TypeScript cannot see it. It
+      // falls into the same reading as `unknown` — which is the point.
+      return 'Upstream state unknown — this sync could not be verified';
+  }
+}
+
+/** A mesh whose manual sync did not finish. Retrying from here is the point of
+ *  putting it in this section: the sync runs through the same `runMeshSync` the
+ *  sidebar uses, and a success resolves this very card. The local `pending`
+ *  state disables the button for the duration of one IPC round trip. */
+function SyncAttentionCard({ notice }: { notice: Notification & { action: MeshSyncNotificationAction } }) {
+  const [pending, setPending] = useState(false);
+  const action = notice.action;
+  return <AttentionCard
+    title="Sync from upstream incomplete"
+    notice={notice}
+    subject={action.meshName}
+    detail={action.detail}
+    path={action.path}
+    status={pending ? 'Retrying…' : syncStatusLine(action.evidence)}
+    testId={`sync-attention-${action.path}`}
+    action={<button type="button" className="notification-resolve" disabled={pending}
+      aria-label={`Retry sync for ${action.meshName}`}
+      onClick={async () => {
+        setPending(true);
+        await runMeshSync({ name: action.meshName, path: action.path });
+        setPending(false);
+      }}>Retry sync <span aria-hidden="true">→</span></button>} />;
+}
+
+function WorktreeAttentionCard({ notice, onResolve }: { notice: Notification & { action: WorktreeNotificationAction }; onResolve: (n: Notification) => void }) {
+  const action = notice.action;
+  return <AttentionCard
+    title="Worktree cleanup blocked"
+    notice={notice}
+    subject={action.nodeName}
+    detail={action.detail}
+    path={action.path}
+    status="Queued for automatic retry"
+    action={<button type="button" className="notification-resolve" aria-label={`Resolve worktree ${action.nodeName}`}
+      onClick={() => onResolve(notice)}>Resolve <span aria-hidden="true">→</span></button>} />;
+}
+
 export function NotificationsTab() {
   const notices = useToastStore(s => s.notifications);
   const loading = useToastStore(s => s.cleanupLoading);
@@ -27,6 +115,16 @@ export function NotificationsTab() {
   const activity = notices.filter(n => !needsAttention(n));
   const unread = notices.filter(n => !n.read).length;
   const clearable = activity.some(n => n.read);
+  // Split the attention set by action kind so each card receives the fields it
+  // actually renders. The two kinds are unrelated problems (a blocked worktree
+  // removal and a mesh that never reached upstream) and are recovered by
+  // different actions, so they must not share one card template. The
+  // predicates are typed on the whole notice, not just its action, because
+  // each card needs `notice` narrowed to read `action.meshName` / `action.detail`.
+  const cleanupAttention = attention.filter(
+    (n): n is Notification & { action: WorktreeNotificationAction } => isWorktreeCleanup(n.action));
+  const syncAttention = attention.filter(
+    (n): n is Notification & { action: MeshSyncNotificationAction } => isMeshSyncFailure(n.action));
 
   useEffect(() => {
     void refreshWorktreeNotifications();
@@ -61,16 +159,10 @@ export function NotificationsTab() {
           <div className="notification-section-heading"><h3>Needs attention</h3><span>{attention.length}</span></div>
           {attention.length === 0 ? <p className="notification-caught-up">
             {error ? 'Worktree status is unavailable.' : loading ? 'Checking worktree problems…' : 'You’re all caught up.'}
-          </p> : attention.map(notice => <article className="notification-attention-card" key={notice.id}>
-            <div className="notification-heading"><h4>Worktree cleanup blocked</h4><NoticeTime notice={notice} /></div>
-            <div className="notification-node">{notice.action!.nodeName}</div>
-            <p>{notice.action!.detail}</p>
-            <code>{notice.action!.path}</code>
-            <div className="notification-card-actions"><span>Queued for automatic retry</span>
-              <button type="button" className="notification-resolve" aria-label={`Resolve worktree ${notice.action!.nodeName}`}
-                onClick={() => resolve(notice)}>Resolve <span aria-hidden="true">→</span></button>
-            </div>
-          </article>)}
+          </p> : <>
+            {syncAttention.map(notice => <SyncAttentionCard key={notice.id} notice={notice} />)}
+            {cleanupAttention.map(notice => <WorktreeAttentionCard key={notice.id} notice={notice} onResolve={resolve} />)}
+          </>}
         </section>
         <section aria-label="Recent activity" className="notification-activity">
           <div className="notification-section-heading"><h3>Recent activity</h3><span>{activity.length}</span></div>

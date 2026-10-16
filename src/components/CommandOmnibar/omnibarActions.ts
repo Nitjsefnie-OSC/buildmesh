@@ -27,6 +27,7 @@ import type { SpawnOption } from '../../lib/groups';
 import { currentTheme, setTheme, type ThemeName } from '../../lib/theme';
 import { mapBackendProviders } from '../../lib/groups';
 import { addToast } from '../../stores/toastStore';
+import { classifySyncResult, noteSyncOutcome, outcomeOf, raiseSyncAttention, reportSyncError, SYNC_PROVIDER } from '../../lib/meshSyncFeedback';
 import * as api from '../../lib/tauri';
 import { useAgentNodeStore } from '../../stores/agentNodeStore';
 import { enterMesh, focusNode } from '../../lib/navigation';
@@ -109,22 +110,80 @@ export function runOmnibarCommand(id: string, ctx: OmnibarActionContext): boolea
  * `git_sync` IPC SEQUENTIALLY (issue #1411 review): each sync is a real git
  * fetch/pull on the mesh's worktree, and launching a dozen of them in
  * parallel floods the backend and the disk. Failures are collected, don't
- * abort the remaining meshes, and surface as one summary toast — the same
- * feedback channel the per-mesh sync in <MeshItem> uses via mesh-sync
- * toasts.
+ * abort the remaining meshes, and surface as one summary toast.
+ *
+ * The per-mesh outcomes are classified the same way the sidebar's
+ * "Force sync from upstream" classifies them, so a `Partial` result — commits
+ * fetched but the fast-forward did not apply — is reported as a problem rather
+ * than counted as success.
+ *
+ * Because N meshes can produce N problems, the per-mesh problems are recorded
+ * SILENTLY (they land in Needs attention and nowhere else) and this function
+ * adds exactly ONE summary toast. N problem toasts would overflow the
+ * three-toast stack, so the meshes the user most needs to know about would be
+ * the ones whose toast had already expired.
  */
 export async function gitSyncAllMeshes(meshes: Mesh[]): Promise<void> {
+  // Nothing to sync is not a result. Reporting "Synced 0 meshes" would put a
+  // success toast on screen for a run that never touched a repository.
+  if (meshes.length === 0) return;
+  const SILENT = { silent: true };
   const failed: string[] = [];
+  // Left behind or unknown — the states that earn a Needs-attention card.
+  const unresolved: string[] = [];
+  // Two different non-failures, kept apart because they are different facts:
+  // no remote means nothing was ever fetched; no upstream means a fetch ran
+  // and there was nothing to compare it against. Reporting either as the
+  // other would tell a user their mesh has no remote when it has one.
+  const noRemote: string[] = [];
+  const noComparison: string[] = [];
+  let synced = 0;
   for (const mesh of meshes) {
+    const target = { name: mesh.name, path: mesh.path };
     try {
-      await api.gitSync(mesh.path);
-    } catch {
+      const result = await api.gitSync(mesh.path);
+      const feedback = classifySyncResult(result);
+      // Publish for every outcome except a provable no-fetch, in one place, so
+      // this loop cannot drift from the single-mesh path: a no_upstream mesh
+      // fetched without being compared and its row still has to re-read the
+      // behind-count, and a failed fetch may have moved a ref before it failed.
+      if (result.status !== 'skipped') noteSyncOutcome(target, outcomeOf(result));
+      if (feedback.unresolved) {
+        (result.status === 'failed' ? failed : unresolved).push(mesh.name);
+        raiseSyncAttention(target, result, SILENT);
+        continue;
+      }
+      // Neither synced nor a problem: say which of the two it is.
+      if (!feedback.verified) {
+        (result.status === 'skipped' ? noRemote : noComparison).push(mesh.name);
+        continue;
+      }
+      synced += 1;
+    } catch (error) {
       failed.push(mesh.name);
+      // The thrown reason goes into the card, not just the summary: "sync
+      // failed" is not actionable and "could not resolve host" is.
+      reportSyncError(target, error, SILENT);
     }
   }
-  if (failed.length > 0) {
-    addToast('Git sync', `Sync failed for: ${failed.join(', ')}`, 'warning');
-  }
+  const problems = [...failed, ...unresolved];
+  // One message, assembled from segments, so the synced count can never go
+  // missing from a branch. A run that fetched and fast-forwarded some meshes
+  // must say so even when others failed — "Sync incomplete for: a" on its own
+  // reads as if nothing was updated, which is the one conclusion this summary
+  // must never support.
+  const details = [
+    problems.length > 0 ? problems.join(', ') : '',
+    noRemote.length > 0 ? `no remote: ${noRemote.join(', ')}` : '',
+    noComparison.length > 0 ? `nothing to compare: ${noComparison.join(', ')}` : '',
+  ].filter(Boolean).join('; ');
+  const headline = synced > 0
+    ? `Synced ${synced} of ${meshes.length} mesh${meshes.length === 1 ? '' : 'es'}`
+    // Nothing synced: say so outright, then name which meshes failed or had
+    // nothing to compare — otherwise those meshes go unreported.
+    : 'No mesh synced';
+  addToast(SYNC_PROVIDER, details ? `${headline} — ${details}` : headline,
+    problems.length > 0 ? 'warning' : synced > 0 ? 'success' : 'info');
 }
 
 /**
