@@ -89,7 +89,21 @@ when it first parks for that inconclusive verdict; repeating the same observatio
 does not repeat the notification. Earlier terminal reviews use Review again to
 recover.
 Both decisions require a note, validate the current revision and attempt, and record
-a human review decision separately from an agent verdict. The next worker tick
+a human review decision separately from an agent verdict. The revision check ignores
+history that only repeats an observation already recorded. A new observation, a step
+change, or any other history row still means the run changed and the action must be
+refreshed. Completing a step that re-enters a bounded review is offered as **Start
+the next review** on the checkpoint and on the manual push while a round remains.
+That is a completed edge into a retry gate whose re-entry reaches a review verdict,
+and the gate's target attempt is still under the same limit the gate will use. On
+the last allowed attempt the same completion is **Record the last round**: recording
+it stops the review. When recovery can continue that run — a node review that still
+has its implementation agent, or the issue-review blueprint — **Review again** adds
+one more round after the run stops. Otherwise the same recording tells the person
+to open the implementation agent and inspect the failed step.
+**Check again** stays a recheck. **Review passed** and **Request changes** keep
+their names. **Start the next review** and **Record the last round** do not approve
+the work. The next worker tick
 follows the existing approval or feedback branch. Operator findings are appended
 to the feedback injection even when its editable prompt omits the reviewer-report
 placeholder; human approvals are attributed to the operator in the merge handoff.

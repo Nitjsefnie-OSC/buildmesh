@@ -13,4 +13,17 @@ outcomes: Array<StepPushOutcome>,
  * The evidence the push would set aside, in plain words. `None` when
  * nothing is holding the step and the push only saves waiting.
  */
-overrides: string | null, };
+overrides: string | null, 
+/**
+ * Choosing completed starts another review pass.
+ */
+starts_next_review: boolean, 
+/**
+ * Choosing completed uses the last review round.
+ */
+ends_review: boolean, 
+/**
+ * Review again can add another round after the run stops. False when
+ * recovery would reject this graph as a custom circuit.
+ */
+review_again: boolean, };

@@ -14,6 +14,19 @@ detail: string | null,
  */
 actions: Array<CheckpointAction>, 
 /**
+ * Completing this unverified step starts another review pass.
+ */
+starts_next_review: boolean, 
+/**
+ * Completing this unverified step uses the last review round.
+ */
+ends_review: boolean, 
+/**
+ * Review again can add another round after the run stops. False when
+ * recovery would reject this graph as a custom circuit.
+ */
+review_again: boolean, 
+/**
  * The agent to open to answer an `input` need.
  */
 agent_node_id: number | null, };

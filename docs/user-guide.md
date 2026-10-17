@@ -319,7 +319,15 @@ and a Done label on the agent does not by itself prove the circuit can advance.
 
 A run that needs you says so on its card: a **What to do next** box explains
 what happened in plain words (the raw error is under *Technical detail*) and offers
-the actions that apply. On a failed run, **Retry this step** runs the failed step
+the actions that apply. When the implementation has finished and another review
+pass is still allowed, **Start the next review** records that and asks the reviewer to
+look again. On the last allowed round, **Record the last round** records the same
+finish and stops the review. When Buildmesh can continue that review, **Review again**,
+once the run has stopped, adds one more round. A custom circuit cannot be continued
+that way: recording the last round tells you to open the implementation agent and
+inspect the failed step. Starting the next review and recording the last round do not approve the work. **Check again** rereads the
+evidence. A repeat of evidence Buildmesh already has does not block these actions;
+something new on the run still asks you to refresh first. On a failed run, **Retry this step** runs the failed step
 again, and **I've done this — continue** records that you did the step yourself
 and lets the run carry on. Both accept a short optional note saying what you did;
 it is kept in the run history when you write one, and the action works without it.

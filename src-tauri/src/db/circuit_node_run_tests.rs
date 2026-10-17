@@ -214,6 +214,11 @@ fn an_unverified_step_offers_exactly_the_actions_the_desktop_run_card_offers() {
             .any(|action| matches!(action, CheckpointAction::Recheck)),
         "a review gate can always be rechecked"
     );
+    assert!(
+        !desktop.checkpoints[0].starts_next_review,
+        "a review verdict is not the next review pass"
+    );
+    assert!(!desktop.checkpoints[0].ends_review);
 
     let listed = only(&conn);
     assert_eq!(listed.revision, desktop.revision);
@@ -224,6 +229,87 @@ fn an_unverified_step_offers_exactly_the_actions_the_desktop_run_card_offers() {
         format!("{:?}", desktop.checkpoints[0].actions),
         "the phone reads the desktop's eligibility, it does not recompute it"
     );
+    assert_eq!(
+        need.starts_next_review,
+        desktop.checkpoints[0].starts_next_review
+    );
+    assert_eq!(need.ends_review, desktop.checkpoints[0].ends_review);
+    assert_eq!(need.review_again, desktop.checkpoints[0].review_again);
+}
+
+#[test]
+fn the_phone_offers_the_next_review_when_the_fix_wait_is_unverified() {
+    let mut conn = conn();
+    let (_, node) = source(&conn, "fixes");
+    let run = review(&mut conn, node, 5);
+    commit_circuit_advance_locked(
+        &mut conn,
+        run,
+        Some("running"),
+        None,
+        &[step_op("await_fixes", "unverified", 2, None)],
+    )
+    .unwrap();
+
+    let desktop = attention_inner(&conn, run).unwrap();
+    let checkpoint = desktop
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.node_id == "await_fixes")
+        .expect("the fix wait is a checkpoint");
+    assert!(checkpoint.starts_next_review);
+    assert!(!checkpoint.ends_review);
+    let listed = only(&conn);
+    let need = listed
+        .needs_you
+        .iter()
+        .find(|need| need.step.node_id == "await_fixes")
+        .expect("the phone lists the fix wait");
+    assert!(need.starts_next_review);
+    assert!(!need.ends_review);
+    assert!(!need.review_again);
+    assert_eq!(need.review_again, checkpoint.review_again);
+    assert_eq!(
+        format!("{:?}", need.actions),
+        format!("{:?}", checkpoint.actions)
+    );
+}
+
+#[test]
+fn the_phone_offers_review_again_on_the_last_allowed_round() {
+    let mut conn = conn();
+    let (_, node) = source(&conn, "last");
+    let run = review(&mut conn, node, 5);
+    commit_circuit_advance_locked(
+        &mut conn,
+        run,
+        Some("running"),
+        None,
+        &[
+            step_op("await_fixes", "unverified", 2, None),
+            step_op("re_review", "completed", 5, None),
+        ],
+    )
+    .unwrap();
+
+    let desktop = attention_inner(&conn, run).unwrap();
+    let checkpoint = desktop
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.node_id == "await_fixes")
+        .expect("the fix wait is a checkpoint");
+    assert!(!checkpoint.starts_next_review);
+    assert!(checkpoint.ends_review);
+    let listed = only(&conn);
+    let need = listed
+        .needs_you
+        .iter()
+        .find(|need| need.step.node_id == "await_fixes")
+        .expect("the phone lists the fix wait");
+    assert!(!need.starts_next_review);
+    assert!(need.ends_review);
+    assert!(need.review_again);
+    assert_eq!(need.review_again, checkpoint.review_again);
 }
 
 #[test]

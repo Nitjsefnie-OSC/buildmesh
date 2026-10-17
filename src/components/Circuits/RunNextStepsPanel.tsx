@@ -28,7 +28,7 @@ import type { AutopilotCircuitRun } from '../../types/generated/AutopilotCircuit
 import type { AutopilotCircuitRunStep } from '../../types/generated/AutopilotCircuitRunStep';
 import type { CheckpointAction } from '../../types/generated/CheckpointAction';
 import type { CircuitRunAttention } from '../../types/generated/CircuitRunAttention';
-import { checkpointActionLabel, checkpointActionNeedsEvidence, describeProblem, recoveryGuidance } from './runNextSteps';
+import { checkpointActionLabel, checkpointActionNeedsEvidence, describeProblem, lastRoundGuidance, recoveryGuidance } from './runNextSteps';
 import { runFailureStep } from './runStepPresentation';
 
 /** A backend answer we can rely on, or `null` (a mock or a skewed build). */
@@ -65,7 +65,13 @@ export function RunNextSteps({ run, steps, roleLabel, busy }: RunNextStepsProps)
   const [note, setNote] = useState('');
   const [noting, setNoting] = useState<string | null>(null);
   /** The recorded result awaiting its note: which step, which outcome. */
-  const [recording, setRecording] = useState<{ nodeId: string; attempt: number; action: CheckpointAction } | null>(null);
+  const [recording, setRecording] = useState<{
+    nodeId: string;
+    attempt: number;
+    action: CheckpointAction;
+    startsNextReview: boolean;
+    endsReview: boolean;
+  } | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
@@ -281,17 +287,20 @@ export function RunNextSteps({ run, steps, roleLabel, busy }: RunNextStepsProps)
                       aria-expanded={needsNote ? open : undefined}
                       onClick={() =>
                         needsNote
-                          ? setRecording(open ? null : { nodeId: checkpoint.node_id, attempt: checkpoint.attempt, action })
+                          ? setRecording(open ? null : { nodeId: checkpoint.node_id, attempt: checkpoint.attempt, action, startsNextReview: checkpoint.starts_next_review, endsReview: checkpoint.ends_review })
                           : void record(checkpoint.node_id, checkpoint.attempt, action)
                       }
                       data-testid={`run-checkpoint-${run.id}-${checkpoint.node_id}-${action}`}
                       className="px-1.5 py-1 rounded-md bg-accent-cyan/15 text-accent-cyan hover:bg-accent-cyan/25 disabled:opacity-40"
                     >
-                      {checkpointActionLabel(action)}
+                      {checkpointActionLabel(action, checkpoint.starts_next_review, checkpoint.ends_review)}
                     </button>
                   );
                 })}
               </div>
+              {checkpoint.ends_review && !checkpoint.starts_next_review && (
+                <p className="mt-0.5 text-text-secondary">{lastRoundGuidance(checkpoint.review_again)}</p>
+              )}
             </div>
           ))}
           {recording !== null && (
@@ -314,7 +323,7 @@ export function RunNextSteps({ run, steps, roleLabel, busy }: RunNextStepsProps)
                 data-testid={`run-checkpoint-confirm-${run.id}`}
                 className="px-1.5 py-1 rounded-md bg-accent-cyan/15 text-accent-cyan hover:bg-accent-cyan/25 disabled:opacity-40"
               >
-                Confirm: {checkpointActionLabel(recording.action)}
+                Confirm: {checkpointActionLabel(recording.action, recording.startsNextReview, recording.endsReview)}
               </button>
             </div>
           )}

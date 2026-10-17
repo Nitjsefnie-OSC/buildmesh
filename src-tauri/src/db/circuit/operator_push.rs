@@ -14,7 +14,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::evidence::{append_history, recovery_view, revision_inner, SOURCE_OPERATOR};
+use super::evidence::{append_history, recovery_view, revision_moved, SOURCE_OPERATOR};
 use crate::circuit::model::StepOutcome;
 use crate::circuit::observation::{CircuitObservationBlocker, WorkEvidence};
 use crate::circuit::stepper::RunView;
@@ -61,6 +61,13 @@ pub struct CircuitStepPush {
     /// The evidence the push would set aside, in plain words. `None` when
     /// nothing is holding the step and the push only saves waiting.
     pub overrides: Option<String>,
+    /// Choosing completed starts another review pass.
+    pub starts_next_review: bool,
+    /// Choosing completed uses the last review round.
+    pub ends_review: bool,
+    /// Review again can add another round after the run stops. False when
+    /// recovery would reject this graph as a custom circuit.
+    pub review_again: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, ts_rs::TS)]
@@ -79,7 +86,7 @@ pub struct CircuitStepPushRequest {
 
 /// Every step of this view a person can push on. Empty unless the run is
 /// running, because [`RunView::operator_push_outcomes`] is.
-pub(crate) fn pushes(view: &RunView) -> Vec<CircuitStepPush> {
+pub(crate) fn pushes(view: &RunView, continuation_supported: bool) -> Vec<CircuitStepPush> {
     view.steps
         .iter()
         .filter_map(|step| {
@@ -88,11 +95,17 @@ pub(crate) fn pushes(view: &RunView) -> Vec<CircuitStepPush> {
                 .into_iter()
                 .filter_map(StepPushOutcome::from_step_outcome)
                 .collect();
-            (!outcomes.is_empty()).then(|| CircuitStepPush {
-                node_id: step.node_id.clone(),
-                attempt: step.attempt,
-                outcomes,
-                overrides: holding_evidence(view, &step.node_id).map(|b| b.message()),
+            (!outcomes.is_empty()).then(|| {
+                let ends_review = view.completion_ends_review(&step.node_id);
+                CircuitStepPush {
+                    node_id: step.node_id.clone(),
+                    attempt: step.attempt,
+                    outcomes,
+                    overrides: holding_evidence(view, &step.node_id).map(|b| b.message()),
+                    starts_next_review: view.completion_starts_next_review(&step.node_id),
+                    ends_review,
+                    review_again: ends_review && continuation_supported,
+                }
             })
         })
         .collect()
@@ -122,8 +135,7 @@ pub(crate) fn push_step_locked(
 ) -> Result<(), String> {
     let note = request.reason.trim();
     let tx = db.transaction().map_err(|e| e.to_string())?;
-    if revision_inner(&tx, request.run_id).map_err(|e| e.to_string())? != request.expected_revision
-    {
+    if revision_moved(&tx, request.run_id, request.expected_revision).map_err(|e| e.to_string())? {
         return Err("The run changed. Refresh it before acting.".into());
     }
     let run = super::ledger::get_circuit_run_inner(&tx, request.run_id)

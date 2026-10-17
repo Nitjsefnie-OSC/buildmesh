@@ -10,7 +10,7 @@ import {
 import type { NodeCircuitRun } from '../api';
 import type { CheckpointAction } from '../../types/generated/CheckpointAction';
 import type { NodeCircuitNeed } from '../../types/generated/NodeCircuitNeed';
-import { checkpointActionLabel, checkpointActionNeedsEvidence, recoveryGuidance } from '../../components/Circuits/runNextSteps';
+import { checkpointActionLabel, checkpointActionNeedsEvidence, lastRoundGuidance, recoveryGuidance } from '../../components/Circuits/runNextSteps';
 import { canCancel, circuitStatusLine, needHeading } from '../circuitRun';
 import { Sheet } from '../ui';
 import { useVisibilityPolling } from '../useVisibilityPolling';
@@ -48,7 +48,7 @@ function decisionTitle(decision: Decision): string {
     case 'approve':
       return `Approve the ${decision.need.step.role}?`;
     case 'record':
-      return checkpointActionLabel(decision.action);
+      return checkpointActionLabel(decision.action, decision.need.starts_next_review, decision.need.ends_review);
     case 'recover':
       return "I've done this — continue";
     case 'cancel':
@@ -151,6 +151,11 @@ export function NodeCircuitRunPanel({
     return readError ? <p className="health-note">Circuit Run status is unavailable: {readError}</p> : null;
   }
 
+  const recordDone = (need: NodeCircuitNeed, action: CheckpointAction) =>
+    action === 'completed' && need.ends_review && !need.starts_next_review
+      ? 'Recorded. The review stops.'
+      : 'Recorded. The run will carry on.';
+
   function choose(next: Decision) {
     decisionAt.current = { runId: run!.run_id, revision: run!.revision };
     setNote('');
@@ -168,7 +173,7 @@ export function NodeCircuitRunPanel({
           action,
           reason,
         }),
-      'Recorded. The run will carry on.',
+      recordDone(need, action),
     );
   const recover = (action: 'retry' | 'continue', reason: string) =>
     act(
@@ -242,10 +247,13 @@ export function NodeCircuitRunPanel({
                       : choose({ kind: 'record', need, action })
                   }
                 >
-                  {checkpointActionLabel(action)}
+                  {checkpointActionLabel(action, need.starts_next_review, need.ends_review)}
                 </button>
               ))}
             </div>
+          )}
+          {need.kind === 'unverified' && need.ends_review && !need.starts_next_review && (
+            <p>{lastRoundGuidance(need.review_again)}</p>
           )}
         </article>
       ))}
@@ -277,6 +285,9 @@ export function NodeCircuitRunPanel({
           <h3>{decisionTitle(openDecision)}</h3>
           {openDecision.kind === 'cancel' && <p>The run stops and its helper agents are closed. Your implementation agent stays open.</p>}
           {openDecision.kind === 'approve' && <p>The run continues past this gate as soon as you confirm.</p>}
+          {openDecision.kind === 'record' && openDecision.action === 'completed' && openDecision.need.ends_review && !openDecision.need.starts_next_review && (
+            <p>{lastRoundGuidance(openDecision.need.review_again)}</p>
+          )}
           {(openDecision.kind === 'record' || openDecision.kind === 'recover') && (
             <label>
               {needsEvidence ? 'Your decision and the evidence for it' : 'What did you do or check? (optional)'}

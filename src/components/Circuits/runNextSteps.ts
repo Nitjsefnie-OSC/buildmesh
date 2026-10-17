@@ -106,7 +106,25 @@ const CHECKPOINT_LABELS: Record<CheckpointAction, string> = {
   retry: 'Try it again',
 };
 
-export function checkpointActionLabel(action: CheckpointAction): string {
+/** Shown when completing the step spends the last round of a review Buildmesh can continue. */
+export const LAST_ROUND_GUIDANCE =
+  'Recording this stops the review. Review again adds one more round after the run stops.';
+
+/** Shown when the same recording stops a review recovery cannot continue. */
+export const LAST_ROUND_MANUAL_RECOVERY =
+  'Recording this stops the review. This custom circuit needs manual recovery. Open its implementation agent and inspect the failed step.';
+
+export function lastRoundGuidance(reviewAgain: boolean): string {
+  return reviewAgain ? LAST_ROUND_GUIDANCE : LAST_ROUND_MANUAL_RECOVERY;
+}
+
+export function checkpointActionLabel(
+  action: CheckpointAction,
+  startsNextReview = false,
+  endsReview = false,
+): string {
+  if (action === 'completed' && startsNextReview) return 'Start the next review';
+  if (action === 'completed' && endsReview) return 'Record the last round';
   return CHECKPOINT_LABELS[action];
 }
 
