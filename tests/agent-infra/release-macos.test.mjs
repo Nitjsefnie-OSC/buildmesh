@@ -1,8 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { macOSChecksumAssetNames, macOSChecksumRows, macOSDmgName, macOSUpdaterArchiveName } from '../../scripts/ci/macos-artifacts.mjs';
+import { buildManifest, createPublishedChecksumManifest } from '../../scripts/ci/publish-macos-checksums.mjs';
 
 const workflow = readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8');
+const verifyWorkflow = readFileSync(new URL('../../.github/workflows/verify.yml', import.meta.url), 'utf8');
+const candidateAudit = readFileSync(new URL('../../scripts/ci/audit-macos-candidate.mjs', import.meta.url), 'utf8');
+const candidateAuditPath = fileURLToPath(new URL('../../scripts/ci/audit-macos-candidate.mjs', import.meta.url));
+const publishChecksums = readFileSync(new URL('../../scripts/ci/publish-macos-checksums.mjs', import.meta.url), 'utf8');
 
 /** The body of one top-level `job:` block, so one job's steps are not read as another's. */
 function jobBlock(jobId) {
@@ -35,13 +44,6 @@ function readConfig(name) {
 const ARM_CONFIG = 'tauri.macos-release.conf.json';
 const INTEL_CONFIG = 'tauri.macos-release-intel.conf.json';
 
-// GitHub's macOS image labels, and what this workflow must and must not use.
-// `macos-13` was the historical Intel label and was retired in December 2025;
-// `macos-14` follows it on 2 November 2026. The Intel leg therefore runs on
-// `macos-15-intel`, which is the last Intel image the service offers before
-// x86_64 support ends in August 2027.
-const RETIRED_MACOS_LABELS = ['macos-13', 'macos-13-large', 'macos-14', 'macos-14-large', 'macos-14-xlarge'];
-
 test('the macOS release job builds both release architectures', () => {
   const job = jobBody('macos-release');
   assert.match(job, /runs-on: \$\{\{ matrix\.runner \}\}/);
@@ -53,13 +55,124 @@ test('the macOS release job builds both release architectures', () => {
   assert.match(job, /- runner: macos-15-intel\n\s+target: x86_64-apple-darwin\n\s+config: src-tauri\/tauri\.macos-release-intel\.conf\.json\n\s+arch: x86_64/);
 });
 
-test('the macOS release job runs on no retired macOS image', () => {
+test('the macOS release job uses the configured native runner labels', () => {
   const job = jobBody('macos-release');
   const runners = [...job.matchAll(/runner: (\S+)/g)].map((match) => match[1]);
   assert.deepEqual(runners.sort(), ['macos-15', 'macos-15-intel']);
-  for (const retired of RETIRED_MACOS_LABELS) {
-    assert.ok(!job.includes(retired), `macos-release must not use the retired \`${retired}\` label`);
-  }
+});
+
+test('published Intel filenames use Tauri x64 names while architecture evidence stays x86_64', () => {
+  assert.equal(macOSDmgName('1.5.0', 'aarch64'), 'Buildmesh_1.5.0_aarch64.dmg');
+  assert.equal(macOSUpdaterArchiveName('1.5.0', 'aarch64'), 'Buildmesh_1.5.0_aarch64.app.tar.gz');
+  assert.equal(macOSDmgName('1.5.0', 'x86_64'), 'Buildmesh_1.5.0_x64.dmg');
+  assert.equal(macOSUpdaterArchiveName('1.5.0', 'x86_64'), 'Buildmesh_1.5.0_x64.app.tar.gz');
+});
+
+test('macOS checksum rows use published release names and bytes', () => {
+  const assets = [
+    'Buildmesh_1.5.0_x64.dmg',
+    'Buildmesh_1.5.0_x64.app.tar.gz',
+    'Buildmesh_1.5.0_x64.app.tar.gz.sig',
+    'latest.json',
+  ];
+  const digest = 'a'.repeat(64);
+  const rows = macOSChecksumRows({
+    tag: 'v1.5.0',
+    architecture: 'x86_64',
+    releaseAssetNames: assets,
+    sha256ByName: {
+      'Buildmesh_1.5.0_x64.dmg': digest,
+      'Buildmesh_1.5.0_x64.app.tar.gz': digest,
+    },
+  });
+  assert.deepEqual(rows, [
+    `${digest}  Buildmesh_1.5.0_x64.dmg`,
+    `${digest}  Buildmesh_1.5.0_x64.app.tar.gz`,
+  ]);
+  assert.throws(() => macOSChecksumRows({
+    tag: 'v1.5.0',
+    architecture: 'x86_64',
+    releaseAssetNames: ['Buildmesh_1.5.0_x64.dmg', 'Buildmesh.app.tar.gz'],
+    sha256ByName: {},
+  }), /does not list expected updater archive Buildmesh_1\.5\.0_x64\.app\.tar\.gz/);
+  const dmgDigest = createHash('sha256').update('published dmg bytes').digest('hex');
+  const updaterDigest = createHash('sha256').update('published updater bytes').digest('hex');
+  assert.equal(buildManifest({
+    tag: 'v1.5.0',
+    architecture: 'x86_64',
+    releaseAssets: assets.map((name) => ({ name })),
+    downloadedAssets: {
+      'Buildmesh_1.5.0_x64.dmg': Buffer.from('published dmg bytes'),
+      'Buildmesh_1.5.0_x64.app.tar.gz': Buffer.from('published updater bytes'),
+    },
+  }), `${dmgDigest}  Buildmesh_1.5.0_x64.dmg\n${updaterDigest}  Buildmesh_1.5.0_x64.app.tar.gz\n`);
+  const downloaded = [];
+  assert.equal(createPublishedChecksumManifest({
+    tag: 'v1.5.0',
+    architecture: 'x86_64',
+    releaseAssets: assets.map((name) => ({ name })),
+    downloadAsset(name) {
+      downloaded.push(name);
+      return Buffer.from(name.endsWith('.dmg') ? 'published dmg bytes' : 'published updater bytes');
+    },
+  }), `${dmgDigest}  Buildmesh_1.5.0_x64.dmg\n${updaterDigest}  Buildmesh_1.5.0_x64.app.tar.gz\n`);
+  assert.deepEqual(downloaded, ['Buildmesh_1.5.0_x64.dmg', 'Buildmesh_1.5.0_x64.app.tar.gz']);
+  assert.deepEqual(macOSChecksumAssetNames({
+    tag: 'v1.5.0',
+    architecture: 'aarch64',
+    releaseAssetNames: [
+      'Buildmesh_1.5.0_aarch64.dmg',
+      'Buildmesh_1.5.0_aarch64.app.tar.gz',
+      'Buildmesh_1.5.0_aarch64.app.tar.gz.sig',
+    ],
+  }), {
+    dmg: 'Buildmesh_1.5.0_aarch64.dmg',
+    updater: 'Buildmesh_1.5.0_aarch64.app.tar.gz',
+  });
+  assert.throws(() => buildManifest({
+    tag: 'v1.5.0',
+    architecture: 'x86_64',
+    releaseAssets: [
+      { name: 'Buildmesh_1.5.0_x64.dmg' },
+      { name: 'Buildmesh.app.tar.gz' },
+    ],
+    downloadedAssets: {
+      'Buildmesh_1.5.0_x64.dmg': Buffer.from('published dmg bytes'),
+      'Buildmesh.app.tar.gz': Buffer.from('local archive bytes'),
+    },
+  }), /does not list expected updater archive/);
+  assert.throws(() => createPublishedChecksumManifest({
+    tag: 'v1.5.0',
+    architecture: 'x86_64',
+    releaseAssets: [
+      { name: 'Buildmesh_1.5.0_x64.dmg' },
+      { name: 'Buildmesh.app.tar.gz' },
+    ],
+    downloadAsset() {
+      assert.fail('must reject the missing published updater archive before downloading');
+    },
+  }), /does not list expected updater archive/);
+});
+
+test('native PR verification exercises the audit CLI and reports real Intel bundle filenames', () => {
+  const marker = '\n  macos-candidate-audit-test:\n';
+  const start = verifyWorkflow.indexOf(marker);
+  assert.notEqual(start, -1, 'verify.yml has no macOS candidate audit job');
+  const job = verifyWorkflow.slice(start);
+  assert.match(job, /needs: changes/);
+  assert.match(job, /if: github\.event_name == 'pull_request' && needs\.changes\.outputs\.rust != 'false'/);
+  assert.match(job, /runs-on: macos-15-intel/);
+  assert.match(job, /node --test tests\/agent-infra\/macos-candidate-audit\.test\.mjs/);
+  assert.match(job, /npm run tauri -- build --debug --target x86_64-apple-darwin/);
+  assert.match(job, /Buildmesh_\$\{version\}_x64\.dmg/);
+  assert.match(job, /Buildmesh\.app\.tar\.gz/);
+
+  const gate = verifyWorkflow.match(/\n {2}rust-bindings:\n([\s\S]*?)(?=\n {2}[a-z][\w-]*:\n)/)?.[1];
+  assert.ok(gate, 'verify.yml has no Rust tests + TS bindings aggregate');
+  assert.match(gate, /needs:\s+\[quality,\s+rust-build,\s+rust-tests,\s+rust-nonshard,\s+changes,\s+macos-candidate-audit-test\]/);
+  assert.match(gate, /MACOS_AUDIT_RESULT: \$\{\{ needs\.macos-candidate-audit-test\.result \}\}/);
+  assert.match(gate, /if\s+\[\s+"\$EVENT_NAME"\s+=\s+pull_request\s+\]\s+&&\s+\[\s+"\$MACOS_AUDIT_RESULT"\s+!=\s+success\s+\];\s+then/);
+  assert.match(gate, /the native macOS candidate audit did not pass/);
 });
 
 // The load-bearing invariant of the whole change: three jobs write one
@@ -73,7 +186,43 @@ test('only one macOS leg builds at a time, so the shared feed cannot race', () =
 
 test('the Windows job is ordered ahead of every other feed writer', () => {
   assert.match(jobBody('macos-release'), /needs: release/);
-  assert.match(jobBody('updater-feed'), /needs: \[release, macos-release\]/);
+  assert.match(jobBody('updater-feed'), /needs: \[release, macos-release, macos-candidate-audit\]/);
+});
+
+test('the draft DMGs are downloaded and audited natively after upload', () => {
+  const job = jobBody('macos-candidate-audit');
+  assert.match(job, /needs: macos-release/);
+  assert.match(job, /- runner: macos-15\n\s+arch: aarch64\n\s+minimum: "11\.0"/);
+  assert.match(job, /- runner: macos-15-intel\n\s+arch: x86_64\n\s+minimum: "10\.13"/);
+  assert.match(job, /node --test tests\/agent-infra\/macos-candidate-audit\.test\.mjs/);
+  assert.match(job, /audit-macos-candidate\.mjs/);
+  assert.match(candidateAudit, /gh', \[/);
+  assert.match(candidateAudit, /'release', 'download'/);
+  assert.match(candidateAudit, /'hdiutil'/);
+  assert.match(candidateAudit, /'codesign'/);
+  assert.match(candidateAudit, /'lipo'/);
+  assert.match(candidateAudit, /'gh', \['release', 'upload'/);
+  assert.match(candidateAudit, /browserDownloadAndQuarantine: 'MANUAL_REQUIRED/);
+  assert.match(candidateAudit, /finderLaunch: 'MANUAL_REQUIRED/);
+  assert.match(candidateAudit, /gatekeeperApproval: 'MANUAL_REQUIRED/);
+  assert.doesNotMatch(job, /latest\.json|uploadUpdaterJson/);
+});
+
+test('candidate audit entrypoint rejects an unsupported host or architecture before release operations', () => {
+  const expectedFailure = process.platform === 'darwin'
+    ? /unsupported architecture invalid/
+    : /must run on a native macOS runner/;
+  const result = spawnSync(process.execPath, [
+    candidateAuditPath,
+    '--tag', 'v1.5.0',
+    '--commit', 'a'.repeat(40),
+    '--arch', 'invalid',
+    '--minimum-macos', '11.0',
+    '--repo', 'alondero/buildmesh',
+  ], { encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, expectedFailure);
+  assert.doesNotMatch(result.stderr, /\n\s+at .+\.mjs:/, 'CLI errors should not include an uncaught stack trace');
 });
 
 test('exactly the two jobs that merge the feed declare an updater json upload', () => {
@@ -176,11 +325,13 @@ test('checksum manifests are per-platform so no job can overwrite another', () =
 
 test('the macOS checksum step covers both the DMG and the updater archive', () => {
   const job = jobBody('macos-release');
-  assert.match(job, /-name '\*\.dmg'/);
-  assert.match(job, /-name '\*\.app\.tar\.gz'/);
-  // shasum is the macOS spelling of sha256sum and emits the same two-space
-  // format the Windows manifest uses.
-  assert.match(job, /shasum -a 256/);
+  assert.match(job, /gh release view "\$TAG" --json assets/);
+  assert.match(job, /node scripts\/ci\/publish-macos-checksums\.mjs/);
+  assert.match(job, /gh release upload "\$TAG" "\$MANIFEST" --clobber/);
+  assert.match(publishChecksums, /'release', 'download'/);
+  assert.match(publishChecksums, /macOSChecksumRows\(/);
+  assert.match(publishChecksums, /createHash\('sha256'\)/);
+  assert.doesNotMatch(job, /asset_arch:/, 'RELEASE_ARCH is the only architecture suffix map');
 });
 
 test('the macOS job asserts the signature is ad-hoc rather than trusting codesign', () => {
@@ -193,7 +344,7 @@ test('the macOS job asserts the signature is ad-hoc rather than trusting codesig
 
 test('the feed check runs after every packaging job and names all three platforms', () => {
   const job = jobBody('updater-feed');
-  assert.match(job, /needs: \[release, macos-release\]/);
+  assert.match(job, /needs: \[release, macos-release, macos-candidate-audit\]/);
   assert.match(job, /verify-updater-feed\.mjs/);
   for (const entry of ['windows-x86_64', 'darwin-aarch64', 'darwin-x86_64']) {
     assert.ok(job.includes(`--require ${entry}`), `updater-feed must require ${entry}`);
@@ -227,8 +378,9 @@ test('the macOS steps avoid bash builtins macOS does not ship', () => {
   for (const builtin of ['mapfile', 'readarray', 'declare -A', 'declare -a']) {
     assert.equal(job.includes(builtin), false, `macos-release must not use \`${builtin}\` (bash 3.2)`);
   }
-  // The portable idiom it uses instead.
-  assert.match(job, /while IFS= read -r asset; do/);
+  // The checksum helper runs Node and downloads exact names from the release.
+  assert.match(job, /gh release view "\$TAG" --json assets/);
+  assert.match(job, /publish-macos-checksums\.mjs/);
 });
 
 test('Android delivery is preserved', () => {
