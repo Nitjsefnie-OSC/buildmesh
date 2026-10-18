@@ -1035,7 +1035,10 @@ fn resolve_spawn_env(
 /// env depends on the harness config and worktree path; test callers
 /// pass the env directly because the test knows the env it wants and
 /// does not need harness-runtime fallback.
-#[allow(dead_code)]
+// Only the per-test helpers below reach this without the writer lock, so it
+// is compiled for tests alone rather than suppressed in every build
+// (issue #2450).
+#[cfg(test)]
 pub(crate) fn create_agent_node_inner(
     db: &Connection,
     node: NewAgentNode<'_>,

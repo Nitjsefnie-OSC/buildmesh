@@ -1054,9 +1054,11 @@ fn sandbox_cleanup(session_id: i64) {
 /// closed by then, so a reader that does not exit promptly can only be
 /// genuinely wedged, and a missing handle means there was nothing to join.
 ///
-/// Production callers discard this; it is read only under `cfg(test)`, so
-/// the dead-code lint is silenced elsewhere.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Production callers discard this; it is read only under `cfg(test)`. The
+/// teardown path must still build and return it (that is the instrumentation
+/// seam), so the lint is allowed here with that reason rather than the
+/// production return type removed (issue #2450).
+#[allow(dead_code)]
 pub(crate) struct TeardownOutcome {
     /// `Some(true)` when the reader thread was joined, `Some(false)` when
     /// it had to be detached, `None` when there was no reader to join

@@ -214,71 +214,6 @@ pub struct NodeCreateParams<'a> {
     pub operation: Option<&'a db::CreateOperationBinding>,
 }
 
-/// Create a new agent node with auto-generated name, environment detection,
-/// and provider resolution.
-///
-/// Pass `None` for `source_pr` / `source_pr_pinned_sha` /
-/// `head_repo_owner` / `head_repo_clone_url` on non-PR spawns (issue-spawn,
-/// handover, hand-spawn). Fork PRs call [`create_with_source_pr_fork`]
-/// directly with the fork fields populated (issue #443). `source_pr_pinned_sha`
-/// (issue #444) is the exact-pinning handle — `None` skips the drift check.
-///
-/// `source_pr` and `source_pr_pinned_sha` are **structurally** rejected here
-/// (asserted at function entry) so a future caller that mistakenly passes
-/// `Some(_)` for either — an importer, a migration script — fails loudly
-/// at the boundary rather than silently writing a
-/// `source_pr` onto a node that didn't actually come from a PR. The PR-spawn
-/// entry point is [`create_with_source_pr_fork`], which is the only function
-/// that should ever pass `Some(_)` for these fields. Pinning test lives in
-/// `services::agent_node::tests` (issue #448).
-///
-/// **Issue #1658 step 5:** every live caller now reaches the create
-/// sequence via [`create_blocking`], the shared runner. `create` is
-/// retained for the structural `source_pr = Some(_)` boundary assert
-/// test coverage (`create_rejects_source_pr_some` et al.); `#[allow]`
-/// keeps the dead-code lint quiet.
-#[allow(dead_code)]
-pub fn create(request: NodeCreateParams<'_>) -> Result<AgentNode, AgentNodeError> {
-    assert!(
-        request.source_pr.is_none(),
-        "services::agent_node::create refuses source_pr=Some(_); \
-         the non-PR wrappers must persist source_pr=None so spawn_agent_inner's \
-         'is this a PR-spawned node?' branch (node.source_pr.is_some()) stays a \
-         reliable signal. Use create_with_source_pr_fork for PR spawns."
-    );
-    assert!(
-        request.source_pr_pinned_sha.is_none(),
-        "services::agent_node::create refuses source_pr_pinned_sha=Some(_); \
-         use create_with_source_pr_fork for PR spawns that need SHA pinning."
-    );
-    // Single insert path; fork fields are None for the non-fork entry point.
-    create_with_source_pr_fork(NodeCreateParams {
-        head_repo_owner: None,
-        head_repo_clone_url: None,
-        configuration: None,
-        initial_prompt: None,
-        operation: None,
-        ..request
-    })
-}
-
-/// Like [`create`], but also records the fork's owner login and clone URL
-/// when the PR is from a fork (issue #443). `spawn_agent_inner` reads
-/// these to register `fork-<owner>` as a remote and fetch the head ref.
-/// For same-repo PRs, pass `None` for both fork fields and call [`create`]
-/// instead — the spawn path then takes the #420 `origin/<head_ref>` branch.
-pub fn create_with_source_pr_fork(
-    request: NodeCreateParams<'_>,
-) -> Result<AgentNode, AgentNodeError> {
-    create_with_source_pr_fork_configured(NodeCreateParams {
-        configuration: None,
-        initial_prompt: None,
-        operation: None,
-        ..request
-    })
-    .map(|created| created.node)
-}
-
 pub fn create_with_source_pr_fork_configured(
     request: NodeCreateParams<'_>,
 ) -> Result<CreatedNode, AgentNodeError> {
@@ -648,46 +583,6 @@ pub fn create_blocking_configured(
     }
 }
 
-/// Like [`create_with_source_pr_fork`], but sets the initial status to [`SessionStatus::Pending`]
-/// so the frontend can distinguish "node row exists, stage-2 not yet
-/// started" from "node row exists, agent is idle and ready to re-spawn".
-///
-/// This is the fast stage-1 of the two-stage issue-spawn flow. The caller
-/// is expected to invoke `start_node_background` to do the slow work
-/// (git fetch, worktree create, PTY spawn) and update the status to
-/// `Running` on success or `Error` on failure. The source-pr / fork-repo
-/// fields follow the same contract as [`create`]: `source_pr` and
-/// `source_pr_pinned_sha` must be `None` here; the PR-spawn entry point
-/// is [`create_pending_with_source_pr_fork`] (issue #448).
-///
-/// **Issue #1658 step 5:** every live caller now reaches the Pending-status
-/// path through [`create_blocking`] with `pending: true`. `create_pending`
-/// is retained for the structural `source_pr = Some(_)` boundary assert
-/// test coverage; `#[allow]` keeps the dead-code lint quiet.
-#[allow(dead_code)]
-pub fn create_pending(request: NodeCreateParams<'_>) -> Result<AgentNode, AgentNodeError> {
-    assert!(
-        request.source_pr.is_none(),
-        "services::agent_node::create_pending refuses source_pr=Some(_); \
-         use create_pending_with_source_pr_fork for PR spawns."
-    );
-    assert!(
-        request.source_pr_pinned_sha.is_none(),
-        "services::agent_node::create_pending refuses source_pr_pinned_sha=Some(_); \
-         use create_pending_with_source_pr_fork for PR spawns that need SHA pinning."
-    );
-    // Single insert path; fork fields are None for the non-fork entry point.
-    create_pending_with_source_pr_fork(NodeCreateParams {
-        use_worktree_override: None,
-        head_repo_owner: None,
-        head_repo_clone_url: None,
-        configuration: None,
-        initial_prompt: None,
-        operation: None,
-        ..request
-    })
-}
-
 /// Pending-node creation with an explicit worktree policy. Issue-driven
 /// circuits use this instead of creating a legacy `autopilot_runs` row: the
 /// circuit ledger remains the owner of orchestration state while the shared
@@ -701,23 +596,6 @@ pub fn create_pending_with_worktree_override_configured(
         head_repo_owner: None,
         head_repo_clone_url: None,
         initial_prompt: None,
-        ..request
-    })
-}
-
-/// Like [`create_pending`], but also records the fork's owner login and
-/// clone URL when the PR is from a fork (issue #443) and the PR's head
-/// commit SHA for exact-pinning (issue #444). `commands::agent::create_pr_node`
-/// calls this directly with the fork fields populated for fork PRs and
-/// `None, None` for same-repo PRs.
-pub fn create_pending_with_source_pr_fork(
-    request: NodeCreateParams<'_>,
-) -> Result<AgentNode, AgentNodeError> {
-    create_pending_with_source_pr_fork_configured(NodeCreateParams {
-        use_worktree_override: None,
-        configuration: None,
-        initial_prompt: None,
-        operation: None,
         ..request
     })
 }
@@ -1749,6 +1627,21 @@ pub fn regenerate_apply_blocking(
 pub fn regenerate_reload_blocking(node_id: i64) -> Result<AgentNode, AgentNodeError> {
     db::get_agent_node_by_id(node_id).map_err(AgentNodeError::from)
 }
+
+// Test-only modules are declared at the BOTTOM of this file on purpose.
+// `agent::output`'s source-scan guard takes each file's production text as
+// everything before its first `#[cfg(test)]` attribute line, so a gated item
+// placed above production code would silently hide every call site after it.
+// Keeping the gates last is what lets that guard stay a short scan instead of
+// a lexer; `agent::output` asserts the invariant on every file it visits.
+#[cfg(test)]
+mod create_tests;
+// Re-exported so `mod tests` keeps calling these bare; the
+// `*_configured` / `create_blocking` functions above are the production surface.
+// The two fork wrappers are called only from `create` / `create_pending` inside
+// `create_tests`, so they stay private to that module.
+#[cfg(test)]
+pub(crate) use create_tests::{create, create_pending};
 
 #[cfg(test)]
 #[path = "agent_node_tests.rs"]
