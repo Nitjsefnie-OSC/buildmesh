@@ -330,3 +330,187 @@ describe('Spawn configurations', () => {
     expect(screen.queryByTestId('spawn-configurations')).toBeNull();
   });
 });
+
+/**
+ * The configuration submenu is a side flyout of the harness row it was
+ * opened from. It used to place itself with two viewport clamps — flip left
+ * when the row had no room on the right, pull up when the panel was taller
+ * than the space below the row — and both clamps could strand the panel in
+ * the top-left corner of the screen, far from its row.
+ */
+describe('Spawn configuration submenu placement', () => {
+  const rowRect = { top: 400, bottom: 424, left: 100, right: 220, width: 120, height: 24, x: 100, y: 400, toJSON: () => ({}) };
+  const collapsedRect = { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) };
+
+  /**
+   * jsdom has no layout and no ResizeObserver, so the observer is a stub the
+   * test fires by hand when the panel's content size changes.
+   */
+  class FakeResizeObserver {
+    static instances: FakeResizeObserver[] = [];
+    private readonly callback: ResizeObserverCallback;
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback;
+      FakeResizeObserver.instances.push(this);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+    static triggerAll() {
+      for (const instance of FakeResizeObserver.instances) {
+        instance.callback([], instance as unknown as ResizeObserver);
+      }
+    }
+  }
+
+  const setViewport = (width: number, height: number) => {
+    Object.defineProperty(window, 'innerWidth', { value: width, configurable: true });
+    Object.defineProperty(window, 'innerHeight', { value: height, configurable: true });
+  };
+
+  beforeEach(() => {
+    FakeResizeObserver.instances = [];
+    (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver = FakeResizeObserver as unknown as typeof ResizeObserver;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+    setViewport(1024, 768);
+  });
+
+  it('keeps the panel on the harness row instead of the viewport corner', async () => {
+    // A cramped viewport: the row sits low and there is no room for the
+    // panel to the right of it.
+    setViewport(400, 768);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rowRect as DOMRect);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(280);
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(600);
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(600);
+
+    render(<GroupedProviderMenu providers={[option]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Codex configurations', exact: true }));
+    const panel = await screen.findByTestId('spawn-configurations');
+
+    // The panel hangs off the row: it keeps the row's left edge (not the
+    // viewport margin) and the row's top line (not the viewport top). The
+    // tall editor scrolls inside the capped panel.
+    expect(panel.style.left).toBe('100px');
+    expect(panel.style.top).toBe('400px');
+    expect(panel.style.maxHeight).toBe('360px');
+  });
+
+  it('opens above the row when there is no usable room below it', async () => {
+    // The row sits at the bottom of the viewport: hanging below it would
+    // leave a sliver, so the panel opens upwards with its bottom edge on the
+    // row instead of drifting to the top of the screen.
+    setViewport(1024, 768);
+    const lowRow = { top: 700, bottom: 724, left: 100, right: 220, width: 120, height: 24, x: 100, y: 700, toJSON: () => ({}) };
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(lowRow as DOMRect);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(280);
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(600);
+
+    render(<GroupedProviderMenu providers={[option]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Codex configurations', exact: true }));
+    const panel = await screen.findByTestId('spawn-configurations');
+
+    expect(panel.style.left).toBe('220px');
+    expect(panel.style.top).toBe('124px');
+    expect(panel.style.maxHeight).toBe('716px');
+  });
+
+  it('keeps the panel inside the viewport when the row is partly below it', async () => {
+    // A row at a scroll boundary: only its top half is on screen, so the
+    // room above it must not be measured past the viewport's bottom edge.
+    setViewport(1024, 768);
+    const clippedRow = { top: 750, bottom: 780, left: 100, right: 220, width: 120, height: 24, x: 100, y: 750, toJSON: () => ({}) };
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(clippedRow as DOMRect);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(280);
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(900);
+
+    render(<GroupedProviderMenu providers={[option]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Codex configurations', exact: true }));
+    const panel = await screen.findByTestId('spawn-configurations');
+
+    const top = parseFloat(panel.style.top);
+    const maxHeight = parseFloat(panel.style.maxHeight);
+    expect(top + maxHeight).toBeLessThanOrEqual(768);
+    expect(top).toBeGreaterThanOrEqual(0);
+  });
+
+  it('keeps the panel inside the viewport when the row is above it', async () => {
+    // The row has been scrolled past the top of the viewport.
+    setViewport(1024, 768);
+    const aboveRow = { top: -40, bottom: -16, left: 100, right: 220, width: 120, height: 24, x: 100, y: -40, toJSON: () => ({}) };
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(aboveRow as DOMRect);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(280);
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(600);
+
+    render(<GroupedProviderMenu providers={[option]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Codex configurations', exact: true }));
+    const panel = await screen.findByTestId('spawn-configurations');
+
+    const top = parseFloat(panel.style.top);
+    const maxHeight = parseFloat(panel.style.maxHeight);
+    expect(top).toBeGreaterThanOrEqual(0);
+    expect(top + maxHeight).toBeLessThanOrEqual(768);
+  });
+
+  it('re-places the panel when the editor content grows', async () => {
+    // The editor owns its draft state: switching to a routed provider adds
+    // endpoint fields without changing the submenu's props, so the placement
+    // has to follow the panel's content size.
+    setViewport(1024, 768);
+    vi.mocked(api.getLaunchTargets).mockResolvedValue([target, {
+      ...target, id: 'codex:minimax', provider_name: 'MiniMax', manual_model: false, default_model: 'MiniMax-M3',
+      route: { harness_id: 'codex', provider_id: 'minimax', surface: 'openai', base_url: 'https://api.minimax.io/v1',
+        model_tiers: { default: 'MiniMax-M3', opus: null, fable: null, sonnet: null, haiku: null, small_fast: null } },
+      route_attached: false, models: [{ id: 'MiniMax-M3', name: 'MiniMax M3', surface: 'openai', efforts: ['none', 'high'] }],
+    }]);
+    const lowRow = { top: 700, bottom: 724, left: 100, right: 220, width: 120, height: 24, x: 100, y: 700, toJSON: () => ({}) };
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(lowRow as DOMRect);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(280);
+    const contentHeight = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(300);
+
+    render(<GroupedProviderMenu providers={[option]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Codex configurations', exact: true }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Clone Sol Max' }));
+    await screen.findByLabelText('Model');
+    const panel = await screen.findByTestId('spawn-configurations');
+    // The short panel opens above the row, its bottom edge on the row.
+    expect(panel.style.top).toBe('424px');
+
+    // The editor grows its own form: the provider switch adds the endpoint
+    // fields. The submenu's props stay the same, so only the observed
+    // content size can move the panel.
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'codex:minimax' } });
+    contentHeight.mockReturnValue(900);
+    FakeResizeObserver.triggerAll();
+
+    // The panel grows upwards from the row instead of downwards across it
+    // and past the viewport.
+    await waitFor(() => expect(panel.style.top).toBe('8px'));
+    expect(parseFloat(panel.style.top) + parseFloat(panel.style.maxHeight)).toBeLessThanOrEqual(768);
+  });
+
+  it('keeps the last placement when the anchor loses its layout', async () => {
+    setViewport(1024, 768);
+    const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rowRect as DOMRect);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(280);
+
+    render(<GroupedProviderMenu providers={[option]} onSelect={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Codex configurations', exact: true }));
+    const panel = await screen.findByTestId('spawn-configurations');
+    expect(panel.style.left).toBe('220px');
+    expect(panel.style.top).toBe('400px');
+
+    // The row is replaced while the submenu is open, so the captured anchor
+    // has no layout any more. Measuring it would report a zero rect and
+    // snap the panel to the top-left corner of the screen.
+    rect.mockReturnValue(collapsedRect as DOMRect);
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Clone Sol Max' }));
+    await screen.findByLabelText('Model');
+    expect(panel.style.left).toBe('220px');
+    expect(panel.style.top).toBe('400px');
+  });
+});
