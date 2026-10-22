@@ -158,6 +158,7 @@ export function buildDefaultFixtures() {
     list_semantic_turns: [] satisfies SemanticTurnPayload[],
     list_circuits_with_runs: circuitsWithRuns,
     list_circuit_queue: circuitQueue,
+    count_circuit_run_attention: 1,
     list_circuit_probe: { circuits: circuitsWithRuns, queue: circuitQueue, queue_waits: {} } satisfies CircuitProbeSnapshot,
     get_github_url_for_mesh: null as string | null,
     get_git_branch_status: null as GitBranchStatus | null,
@@ -165,6 +166,9 @@ export function buildDefaultFixtures() {
     get_app_identifier: 'com.alond.buildmesh.dev',
     log_frontend: null,
     subscribe_agent_output: null,
+    resize_agent: null,
+    watch_agent_node: null,
+    unwatch_agent_node: null,
     get_app_preferences: {
       companion: { launch_configuration: null, spawn_limit: 1 },
       default_provider: 'anthropic', reviewer_provider: null,

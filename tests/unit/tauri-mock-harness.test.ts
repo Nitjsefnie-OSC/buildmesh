@@ -56,6 +56,7 @@ describe('tauri-mock harness', () => {
     install();
     const invoke = window.__TAURI_INTERNALS__.invoke;
     await expect(invoke('plugin:window|is_focused')).resolves.toBe(true);
+    await expect(invoke('plugin:window|is_maximized')).resolves.toBe(false);
     await expect(invoke('plugin:global-shortcut|is_registered')).resolves.toBe(false);
     await expect(invoke('plugin:global-shortcut|register')).resolves.toBeNull();
     await expect(invoke('plugin:global-shortcut|register_typo')).rejects.toThrow('plugin:global-shortcut|register_typo');
@@ -69,6 +70,19 @@ describe('tauri-mock harness', () => {
     eval(buildInitScript(undefined, undefined, { ignoredCommands: ['intentional_noop'] }));
     await expect(window.__TAURI_INTERNALS__.invoke('intentional_noop')).resolves.toBeNull();
     await expect(window.__TAURI_INTERNALS__.invoke('unlisted_noop')).rejects.toThrow('unlisted_noop');
+  });
+
+  it.each([
+    ['resize_agent', { sessionId: 1, cols: 80, rows: 24 }],
+    ['watch_agent_node', { nodeId: 1 }],
+    ['unwatch_agent_node', { nodeId: 1 }],
+  ])('models %s only when the boot fixtures are installed', async (command, args) => {
+    install({});
+    await expect(window.__TAURI_INTERNALS__.invoke(command, args))
+      .rejects.toThrow(command);
+    install();
+    await expect(window.__TAURI_INTERNALS__.invoke(command, args))
+      .resolves.toBeNull();
   });
 
   it('roundtrips listen → emit → unlisten through the callback registry', async () => {

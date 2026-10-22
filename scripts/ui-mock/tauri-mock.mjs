@@ -110,6 +110,7 @@ export function buildInitScript(fixtures, handlers = defaultHandlers, { ignoredC
     'plugin:event|emit': null,
     'plugin:event|emit_to': null,
     'plugin:window|is_focused': true,
+    'plugin:window|is_maximized': false,
     'plugin:window|scale_factor': 1,
     'plugin:window|theme': 'dark',
     'plugin:window|inner_size': { width: 1440, height: 900 },
