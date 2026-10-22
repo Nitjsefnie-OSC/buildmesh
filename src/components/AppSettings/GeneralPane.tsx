@@ -27,6 +27,7 @@ import { useBlurCommit } from '../../hooks/useBlurCommit';
 import { SettingsRow, SettingsSection } from './SettingsRow';
 import { ResourceLoadStatus } from './ResourceLoadStatus';
 import { UpdateAboutSection } from './UpdateAboutSection';
+import { CompanionSettingsSection } from './CompanionSettingsSection';
 import { useSettingsData } from './SettingsDataContext';
 
 export function GeneralPane() {
@@ -342,6 +343,7 @@ export function GeneralPane() {
           current version + manual check + install progress for users
           who want to drive it themselves. */}
       <UpdateAboutSection />
+      <CompanionSettingsSection />
     </>
   );
 }
