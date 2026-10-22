@@ -56,6 +56,13 @@ jobs:
           ref: ${{ inputs.target_ref }}
           fetch-depth: 0
 
+      # The agent-infra suites below include release-notes tests that resolve
+      # the repository's own base from its release tags. A fork checkout
+      # carries only the tags synced at fork time, so fetch the upstream
+      # tags explicitly or the resolution test reds on a healthy tree.
+      - name: Fetch upstream release tags
+        run: git fetch --tags https://github.com/alondero/buildmesh
+
       # Provenance: resolve whatever ref syntax was supplied to the exact
       # commit under test and print it as a literal, greppable log line. The
       # untrusted input reaches the shell only through an environment
