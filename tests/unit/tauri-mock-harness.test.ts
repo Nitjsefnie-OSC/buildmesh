@@ -118,6 +118,12 @@ describe('tauri-mock harness', () => {
     await expect(window.__TAURI_INTERNALS__.invoke('list_circuits_with_runs', { meshId: 2 })).resolves.toEqual([]);
   });
 
+  it('preserves the circuit probe contract while filtering by mesh', async () => {
+    install();
+    await expect(window.__TAURI_INTERNALS__.invoke('list_circuit_probe', { meshId: 2 }))
+      .resolves.toEqual({ circuits: [], queue: [], queue_waits: {} });
+  });
+
   it('does not send unknown-command diagnostics through console.info', async () => {
     const info = vi.spyOn(console, 'info').mockImplementation(() => {});
     const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});

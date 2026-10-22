@@ -23,151 +23,18 @@
  */
 
 import { readFileSync } from 'fs';
+import { ModuleKind, ScriptTarget, transpileModule } from 'typescript';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, resolve } from 'path';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-/**
- * Default fixtures — enough for the desktop shell to boot populated: two
- * meshes, a couple of agent nodes, the Anthropic provider, and empty/benign
- * reads for the rest. Keyed by Tauri command name (the string passed to
- * `invoke`). A value may be a literal or `(args) => value`. Steps files and
- * `--fixtures` merge over this.
- *
- * Field shapes mirror the generated wire types (src/types/generated/*). The
- * `..default` spreads below keep new backend columns from breaking the mock:
- * unknown-but-required fields fall back to zero-values, matching the Rust
- * `#[derive(Default)]` fixtures.
- */
-const meshDefaults = {
-  layout: 'grid', position: 0, created_at: '1970-01-01T00:00:00Z',
-  build_command: null, run_command: null, model: null, effort: null,
-  use_worktree: true, worktree_mode: 'perNode', default_provider: null,
-  base_ref: 'origin/main', scratchpad: '', sandbox: false,
-  pre_spawn_pool_size: 1, color: null,
-};
-
-const nodeDefaults = {
-  env: 'Windows', provider: 'anthropic', cli_session_id: null,
-  worktree_name: null, use_worktree: true, source_issue: null,
-  source_pr: null, head_repo_owner: null, head_repo_clone_url: null,
-  source_pr_pinned_sha: null, created_at: '1970-01-01T00:00:00Z',
-};
-
-const meshes = [
-  { ...meshDefaults, id: 1, name: 'buildmesh', path: '/home/user/buildmesh', position: 0, color: '#6366f1' },
-  { ...meshDefaults, id: 2, name: 'playground', path: '/home/user/playground', position: 1, color: '#10b981' },
-];
-
-const agentNodes = [
-  { ...nodeDefaults, id: 1, mesh_id: 1, name: 'fix-terminal-blank', path: '/home/user/buildmesh', branch: 'origin/main', status: 'running', position: 0 },
-  { ...nodeDefaults, id: 2, mesh_id: 1, name: 'diff-panel-refactor', path: '/home/user/buildmesh', branch: 'origin/main', status: 'awaiting_input', position: 1 },
-  { ...nodeDefaults, id: 3, mesh_id: 2, name: 'scratch', path: '/home/user/playground', branch: 'origin/main', status: 'idle', position: 0 },
-];
-
-const circuitsWithRuns = [
-  {
-    circuit: {
-      id: 101,
-      mesh_id: 1,
-      name: 'Issue review loop',
-      description: 'Review labelled issues and report the result.',
-      enabled: true,
-      graph_json: '{"nodes":[],"edges":[]}',
-      created_at: '2026-01-01T00:00:00Z',
-      updated_at: '2026-01-01T00:00:00Z',
-    },
-    runs: [
-      {
-        run: {
-          id: 1001,
-          circuit_id: 101,
-          mesh_id: 1,
-          trigger_identity: 'issue:1468:buildmesh:run',
-          state: 'failed',
-          context_json: '{}',
-          created_at: '2026-01-01T00:00:00Z',
-          updated_at: '2026-01-01T00:02:00Z',
-        },
-        steps: [
-          {
-            id: 1002,
-            run_id: 1001,
-            node_id: 'reviewer',
-            agent_node_id: 2,
-            status: 'failed',
-            attempt: 1,
-            outcome: 'failed',
-            error_message: 'The review command exited before producing a result.',
-            started_at: '2026-01-01T00:01:00Z',
-            completed_at: '2026-01-01T00:02:00Z',
-          },
-        ],
-      },
-    ],
-  },
-];
-
-const circuitQueue = [
-  {
-    run: {
-      id: 1002,
-      circuit_id: 101,
-      mesh_id: 1,
-      trigger_identity: 'issue:1501:buildmesh:run',
-      state: 'pending',
-      context_json: '{}',
-      created_at: '2026-01-01T00:03:00Z',
-      updated_at: '2026-01-01T00:03:00Z',
-    },
-    circuit_name: 'Issue review loop',
-    queue_rank: 1,
-  },
-  {
-    run: {
-      id: 1003,
-      circuit_id: 101,
-      mesh_id: 1,
-      trigger_identity: 'issue:1502:buildmesh:run',
-      state: 'pending',
-      context_json: '{}',
-      created_at: '2026-01-01T00:04:00Z',
-      updated_at: '2026-01-01T00:04:00Z',
-    },
-    circuit_name: 'Issue review loop',
-    queue_rank: 2,
-  },
-];
-
-export const defaultFixtures = {
-  list_meshes: meshes,
-  list_agent_nodes: agentNodes,
-  get_default_provider: 'anthropic',
-  list_providers: [
-    { id: 'anthropic', name: 'Claude', description: 'Anthropic Claude Code', icon: null, available: true, kind: 'cwrap' },
-  ],
-  list_circuit_agent_ownerships: [],
-  list_semantic_turns: [],
-  list_circuits_with_runs: circuitsWithRuns,
-  list_circuit_queue: circuitQueue,
-  list_circuit_probe: { circuits: circuitsWithRuns, queue: circuitQueue },
-  get_github_url_for_mesh: null,
-  get_git_branch_status: null,
-  get_git_summary: null,
-  get_app_identifier: 'com.alond.buildmesh.dev',
-  log_frontend: null,
-  subscribe_agent_output: null,
-  get_app_preferences: { default_provider: 'anthropic', minimax_api_key_set: false, google_cloud_project: null },
-  get_provider_accounts: [],
-  get_network_status: { lan_exposure_enabled: false, bound_port: 1992, realized_binds: [] },
-  auto_resume_agent_nodes: [],
-  is_agent_running: false,
-  is_attention_pending: false,
-  get_git_status: [],
-  get_open_pr_for_node: null,
-  get_mesh_pool_count: 0,
-};
+// Keep the browser script JavaScript while sourcing its JSON from the same
+// TypeScript fixture builder checked by tsc. Transpile in memory for Node 20.
+const fixtureSource = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), 'default-fixtures.ts'), 'utf8');
+const { outputText } = transpileModule(fixtureSource, {
+  compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2020 },
+});
+const { buildDefaultFixtures } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
+export const defaultFixtures = buildDefaultFixtures();
 
 /**
  * Stateful responses that need request-specific behaviour live here instead
@@ -197,6 +64,7 @@ const defaultHandlers = {
     const meshId = args?.meshId;
     if (!snapshot || meshId === undefined || meshId === null) return snapshot;
     return {
+      ...snapshot,
       circuits: (snapshot.circuits ?? []).filter((row) => row?.circuit?.mesh_id === Number(meshId)),
       queue: (snapshot.queue ?? []).filter((entry) => entry?.run?.mesh_id === Number(meshId)),
     };
