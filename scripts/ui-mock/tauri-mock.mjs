@@ -23,16 +23,25 @@
  */
 
 import { readFileSync } from 'fs';
-import { ModuleKind, ScriptTarget, transpileModule } from 'typescript';
+import { DiagnosticCategory, ModuleKind, ScriptTarget, flattenDiagnosticMessageText, transpileModule } from 'typescript';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, resolve } from 'path';
 
 // Keep the browser script JavaScript while sourcing its JSON from the same
 // TypeScript fixture builder checked by tsc. Transpile in memory for Node 20.
-const fixtureSource = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), 'default-fixtures.ts'), 'utf8');
-const { outputText } = transpileModule(fixtureSource, {
+const fixturePath = resolve(dirname(fileURLToPath(import.meta.url)), 'default-fixtures.ts');
+const fixtureSource = readFileSync(fixturePath, 'utf8');
+const { outputText, diagnostics } = transpileModule(fixtureSource, {
+  fileName: fixturePath,
+  reportDiagnostics: true,
   compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2020 },
 });
+const errors = (diagnostics ?? []).filter(diagnostic => diagnostic.category === DiagnosticCategory.Error);
+if (errors.length) {
+  throw new Error(errors.map(diagnostic =>
+    `${fixturePath}: TS${diagnostic.code}: ${flattenDiagnosticMessageText(diagnostic.messageText, '\n')}`
+  ).join('\n'));
+}
 const { buildDefaultFixtures } = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
 export const defaultFixtures = buildDefaultFixtures();
 
