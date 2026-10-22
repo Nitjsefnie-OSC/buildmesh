@@ -85,9 +85,11 @@ function serializeHandlers(handlers) {
  * the browser via `page.addInitScript`, BEFORE any app module — so the
  * frontend's very first `invoke` already sees the shim. Fixtures are JSON
  * inlined so no Node<->browser bridge is needed at boot; interactive
- * overrides go through `window.__BUILDMESH_MOCK__` at runtime.
+ * overrides go through `window.__BUILDMESH_MOCK__` at runtime. Unmodelled
+ * commands reject; intentionally ignored side effects must be named in
+ * the third argument's `ignoredCommands` allowlist (or fixtured explicitly).
  */
-export function buildInitScript(fixtures, handlers = defaultHandlers) {
+export function buildInitScript(fixtures, handlers = defaultHandlers, { ignoredCommands = [] } = {}) {
   const json = JSON.stringify(fixtures ?? defaultFixtures);
   const handlerSource = serializeHandlers(handlers);
   // Note: `fixtures` values that are functions can't cross the JSON
@@ -96,21 +98,26 @@ export function buildInitScript(fixtures, handlers = defaultHandlers) {
   return `(() => {
   const responses = ${json};
   const handlers = { ${handlerSource} };
+  const ignoredCommands = new Set(${JSON.stringify(ignoredCommands)});
   const overrides = {};
   let nextId = 1;
   const callbacks = {};            // callback id -> fn (from transformCallback)
   const listeners = {};            // event name -> Set<callback id>
 
   const win = { label: 'main' };
-  const benignPlugin = (cmd) => {
-    if (cmd.startsWith('plugin:event|')) return null;
-    if (cmd.startsWith('plugin:window|is_focused')) return true;
-    if (cmd.startsWith('plugin:window|scale_factor')) return 1;
-    if (cmd.startsWith('plugin:window|theme')) return 'dark';
-    if (cmd.startsWith('plugin:window|inner_size') || cmd.startsWith('plugin:window|outer_size')) return { width: 1440, height: 900 };
-    if (cmd.startsWith('plugin:global-shortcut|is_registered')) return false;
-    if (cmd.startsWith('plugin:')) return null;   // register/unregister/emit/etc.
-    return undefined;
+  const benignPlugins = {
+    'plugin:event|unlisten': null,
+    'plugin:event|emit': null,
+    'plugin:event|emit_to': null,
+    'plugin:window|is_focused': true,
+    'plugin:window|scale_factor': 1,
+    'plugin:window|theme': 'dark',
+    'plugin:window|inner_size': { width: 1440, height: 900 },
+    'plugin:window|outer_size': { width: 1440, height: 900 },
+    'plugin:global-shortcut|is_registered': false,
+    'plugin:global-shortcut|register': null,
+    'plugin:global-shortcut|unregister': null,
+    'plugin:global-shortcut|unregister_all': null,
   };
 
   const invoke = async (cmd, args) => {
@@ -131,14 +138,11 @@ export function buildInitScript(fixtures, handlers = defaultHandlers) {
       (listeners[args.event] ||= new Set()).add(args.handler);
       return args.handler;
     }
-    const p = benignPlugin(cmd);
-    if (p !== undefined) return p;
-    // Unknown app command: resolve null rather than reject, so a screen
-    // that reads a command we didn't fixture renders empty instead of
-    // throwing. console.debug deliberately bypasses the frontend log bridge,
-    // which forwards console.info/warn/error back through invoke.
+    if (Object.prototype.hasOwnProperty.call(benignPlugins, cmd)) return benignPlugins[cmd];
+    if (ignoredCommands.has(cmd)) return null;
+    // Debug bypasses the frontend log bridge, avoiding recursive IPC logging.
     if (!window.__BUILDMESH_MOCK__.quiet) console.debug('[tauri-mock] unmocked invoke:', cmd, args ?? '');
-    return null;
+    throw new Error('[tauri-mock] Unmocked IPC command: ' + cmd);
   };
 
   window.__TAURI_INTERNALS__ = {
