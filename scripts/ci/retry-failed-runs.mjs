@@ -95,7 +95,7 @@ export async function ghJson(args) {
   try {
     return JSON.parse(stdout);
   } catch (err) {
-    throw new Error(`gh ${args.join(' ')} returned invalid JSON: ${err.message}`);
+    throw new Error(`gh ${args.join(' ')} returned invalid JSON: ${err.message}`, { cause: err });
   }
 }
 
