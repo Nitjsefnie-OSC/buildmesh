@@ -119,6 +119,15 @@ jobs:
       - name: Unit tests
         run: ./node_modules/.bin/vitest run tests/unit
 
+      # Agent-infrastructure contract suites (node:test): the CI scripts and
+      # workflow invariants the unit suite above does not reach (verify.yml's
+      # quality-gates job runs them as test:agent/test:docs/test:readme/
+      # test:lint). Invoked through the runner directly so the candidate's
+      # scripts block cannot redefine or skip them; the glob runs every
+      # *.test.mjs under the directory so the list cannot drift from the tree.
+      - name: Agent-infra tests
+        run: node --test tests/agent-infra/*.test.mjs
+
       # Exact-tree gate 2: validation steps must not have moved HEAD or
       # dirtied the tracked worktree (staged or unstaged).
       - name: Verify exact tree after validation
